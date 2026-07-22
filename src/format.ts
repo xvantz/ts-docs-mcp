@@ -23,7 +23,7 @@ export function mergeSymbols(github: PublicSymbol[], tarball: PublicSymbol[]): P
   return merged;
 }
 
-/** Clean a raw signature for display: remove leading 'export ', collapse whitespace, truncate. */
+/** Clean a raw signature for display (summary mode): remove 'export ', collapse whitespace, truncate. */
 function cleanSignature(sig: string, maxLen = 120): string {
   return sig
     .replace(/^export\s+/, "")
@@ -64,11 +64,11 @@ export function toSummary(symbols: PublicSymbol[], pkgName: string, version: str
     perKind[s.kind].push(s);
   }
 
-  const order = ["class", "interface", "function", "enum", "type", "variable"];
+  const order = ["class", "interface", "function", "enum", "type", "variable", "namespace"];
   for (const kind of order) {
     const all = perKind[kind];
     if (!all?.length) continue;
-    const plural = kind === "class" ? "Classes" : kind === "interface" ? "Interfaces" : kind === "function" ? "Functions" : kind === "type" ? "Type Aliases" : kind === "variable" ? "Variables" : `${kind}s`;
+    const plural = kind === "class" ? "Classes" : kind === "interface" ? "Interfaces" : kind === "function" ? "Functions" : kind === "type" ? "Type Aliases" : kind === "variable" ? "Variables" : kind === "namespace" ? "Namespaces" : `${kind}s`;
     const maxShow = 15;
     const items = all.slice(0, maxShow);
     lines.push(`## ${plural} (${all.length})${all.length > maxShow ? ` — showing ${maxShow}` : ""}\n`);
@@ -87,25 +87,55 @@ export function toSummary(symbols: PublicSymbol[], pkgName: string, version: str
   return lines.join("\n");
 }
 
-/** Build a detailed page for a single symbol. */
+/** Extract @param and @returns from a JSDoc string. */
+function extractDocAnnotations(jsdoc: string): { paramText: string; returnsText: string } {
+  const params: string[] = [];
+  let returns = "";
+  for (const line of jsdoc.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("@param ")) {
+      params.push(trimmed);
+    } else if (trimmed.startsWith("@returns ") || trimmed.startsWith("@return ")) {
+      returns = trimmed;
+    }
+  }
+  return { paramText: params.join("\n"), returnsText: returns };
+}
+
+/** Build a detailed page for a single symbol. Full signatures, no truncation. */
 export function formatSymbolDetail(item: PublicSymbol): string {
   const lines: string[] = [];
   lines.push(`## ${item.name} (${item.kind})`);
-  if (item.deprecation) lines.push(`> ⚠️ *Deprecated:* ${item.deprecation}`);
-  if (item.jsdoc) lines.push(`> ${item.jsdoc}`);
+  if (item.deprecation) lines.push(`> ⚠️ *Deprecated:* ${item.deprecation.replace(/^true$/, "")}`);
+  if (item.jsdoc) lines.push(`> ${item.jsdoc.replace(/\n/g, "\n> ")}`);
   lines.push("");
-  lines.push(`\`\`\`typescript\n${item.signature}\n\`\`\``);
+  lines.push("```typescript");
+  lines.push(item.signature);
+  lines.push("```");
   lines.push("");
+
+  // Show @param / @returns if present in jsdoc
+  const { paramText, returnsText } = extractDocAnnotations(item.jsdoc);
+  if (paramText) {
+    lines.push("**Parameters:**\n");
+    for (const p of paramText.split("\n")) {
+      lines.push(`- \`${p.replace(/^@param\s+/, "")}\``);
+    }
+    lines.push("");
+  }
+  if (returnsText) {
+    lines.push(`**Returns:** \`${returnsText.replace(/^@returns?\s+/, "")}\``);
+    lines.push("");
+  }
 
   if (item.methods && item.methods.length > 0) {
     const withJSDoc = item.methods.filter(m => m.jsdoc);
     lines.push("### Methods\n");
     for (const m of (withJSDoc.length > 0 ? withJSDoc : item.methods).slice(0, 25)) {
-      if (m.jsdoc) {
-        if (m.deprecation) lines.push(`> ⚠️ *Deprecated:* ${m.deprecation}`);
-        lines.push(`> ${m.jsdoc}`);
-      }
-      lines.push(`- \`${m.signature.replace(/\n/g, " ").replace(/  +/g, " ").slice(0, 150)}\``);
+      if (m.deprecation) lines.push(`> ⚠️ *Deprecated:* ${m.deprecation}`);
+      if (m.jsdoc) lines.push(`> ${m.jsdoc}`);
+      // Full signature for detail view — no truncation
+      lines.push(`- \`${m.signature.replace(/\n/g, " ").replace(/  +/g, " ").trim()}\``);
     }
     if (item.methods.length > 25) {
       lines.push(`\n*… ${item.methods.length - 25} more methods*`);

@@ -91,6 +91,10 @@ function tryMatchDeclaration(line: string): DeclMatch | null {
   m = trimmed.match(/^declare\s+(class|interface|function|type|enum|const|let|var|namespace)\s+(\w+)/);
   if (m) return { name: m[2], kind: m[1] };
 
+  // declare module "name" — .d.ts pattern
+  m = trimmed.match(/^declare\s+module\s+["']([^"']+)["']/);
+  if (m) return { name: m[1], kind: "namespace" };
+
   // export declare function/class/interface
   m = trimmed.match(/^export\s+declare\s+(class|interface|function)\s+(\w+)/);
   if (m) return { name: m[2], kind: m[1] };
@@ -405,6 +409,30 @@ function emitSymbol(
       signature,
       deprecation: jsdocInfo.deprecation,
       methods: methods && methods.length > 0 ? methods : undefined,
+    });
+    return afterBody;
+  }
+
+  // For namespaces / declare module: collect body and recursively parse inner declarations
+  if (kind === "namespace") {
+    const [bodyLines, afterBody] = collectBody(lines, nextIdx, braceDepth > 0 ? braceDepth : 0);
+    if (bodyLines.length > 0) {
+      const innerSource = bodyLines.join("\n");
+      const innerSymbols = parsePublicAPI(innerSource);
+      for (const s of innerSymbols) {
+        if (!seen.has(s.name)) {
+          seen.add(s.name);
+          symbols.push(s);
+        }
+      }
+    }
+    // Still register the namespace itself
+    symbols.push({
+      name: match.name,
+      kind: "namespace",
+      jsdoc: fullJSDoc(jsdocInfo),
+      signature,
+      deprecation: jsdocInfo.deprecation,
     });
     return afterBody;
   }

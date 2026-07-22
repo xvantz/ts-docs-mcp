@@ -143,7 +143,8 @@ async function tryFetchRaw(urls: string[]): Promise<string | null> {
   for (const url of urls) {
     try {
       const text = await fetchText(url);
-      if (text.length > 30 && !text.startsWith("404")) return text;
+      // GitHub raw returns HTTP 200 with "404: Not Found\n" body for missing files
+      if (text.length > 15 && !text.startsWith("404:")) return text;
     } catch { /* try next ref */ }
   }
   return null;

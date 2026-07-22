@@ -17,7 +17,7 @@ export interface PackageInfo {
 /** A parsed public API symbol with its JSDoc documentation. */
 export interface PublicSymbol {
   name: string;
-  kind: "class" | "interface" | "function" | "type" | "variable" | "enum";
+  kind: "class" | "interface" | "function" | "type" | "variable" | "enum" | "namespace";
   jsdoc: string;
   signature: string;
   deprecation?: string;
