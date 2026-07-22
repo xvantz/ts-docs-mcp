@@ -113,12 +113,18 @@ async function fetchSourceFile(
     paths.push(`lib/${cleanHint}`); // lib/ prefix
   }
   paths.push(
-    "src/index.ts", "lib/index.ts", "index.ts",
+    "src/index.ts", "lib/index.ts",
+    "lib/index.js", "lib/express.js", "lib/main.js",
+    "src/index.js", "src/main.js",
+    "index.ts", "index.js", "express.js",
     `packages/${repo}/src/index.ts`,
     `packages/${pkgDir}/src/index.ts`,
     `packages/${repo}/lib/index.ts`,
-    `${repo}/src/index.ts`,        // monorepo where package = repo name
-    `${pkgDir}/src/index.ts`,      // monorepo where package = pkg name
+    `packages/${repo}/lib/index.js`,
+    `${repo}/src/index.ts`,
+    `${pkgDir}/src/index.ts`,
+    `${repo}/src/index.js`,
+    `${pkgDir}/src/index.js`,
     "packages/core/src/index.ts",
   );
 
@@ -130,7 +136,10 @@ async function fetchSourceFile(
       const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${p}`;
       try {
         const content = await fetchText(url);
-        return { content, path: p };
+        // GitHub raw returns 200 with "404: Not Found" body for missing files
+        if (content.length > 50 && !content.startsWith("404")) {
+          return { content, path: p };
+        }
       } catch {}
     }
   }
@@ -229,13 +238,14 @@ function parsePublicAPI(source: string): PublicSymbol[] {
         i++;
       }
 
-      // Collect the declaration (until { or ; or blank line)
+      // Collect the declaration (until { or ; or next comment)
       let declLines: string[] = [];
       while (i < lines.length) {
         const dl = lines[i].trim();
+        if (dl === "" || dl.startsWith("//")) { i++; continue; }
         declLines.push(lines[i]);
-        if (dl === "{" || dl.endsWith("{") || dl.endsWith(";") || dl === "" ||
-            dl.startsWith("//") || dl.startsWith("/**") || dl.startsWith("*/")) {
+        if (dl === "{" || dl.endsWith("{") || dl.endsWith(";") ||
+            dl.startsWith("/**") || dl.startsWith("*/")) {
           break;
         }
         i++;
@@ -246,12 +256,15 @@ function parsePublicAPI(source: string): PublicSymbol[] {
       const deprecation = extractDeprecation(jsdocLines);
 
       // Match: export class|interface|function|enum|type|const Name
+      // Also match plain: function Name (CommonJS)
       const classMatch = decl.match(/(?:export\s+)?(?:default\s+)?class\s+(\w+)/);
       const ifaceMatch = decl.match(/(?:export\s+)?(?:default\s+)?interface\s+(\w+)/);
       const funcMatch = decl.match(/(?:export\s+)?(?:default\s+)?function\s+(\w+)/);
       const typeMatch = decl.match(/(?:export\s+)?type\s+(\w+)/);
       const constMatch = decl.match(/(?:export\s+)?(?:const|let|var)\s+(\w+)/);
       const enumMatch = decl.match(/(?:export\s+)?(?:default\s+)?enum\s+(\w+)/);
+      // Plain function for CommonJS: function name(...)
+      const plainFuncMatch = decl.match(/^(?:async\s+)?function\s+(\w+)/);
 
       if (classMatch) {
         symbols.push({
@@ -265,9 +278,10 @@ function parsePublicAPI(source: string): PublicSymbol[] {
           deprecation,
           methods: parseMethods(source, ifaceMatch[1]),
         });
-      } else if (funcMatch) {
+      } else if (funcMatch || plainFuncMatch) {
+        const name = funcMatch?.[1] ?? plainFuncMatch![1];
         symbols.push({
-          name: funcMatch[1], kind: "function", jsdoc, signature: decl,
+          name, kind: "function", jsdoc, signature: decl,
           deprecation,
         });
       } else if (enumMatch) {
