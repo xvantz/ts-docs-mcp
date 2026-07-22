@@ -28,6 +28,21 @@ import { toSummary, formatSymbolDetail, mergeSymbols } from "./format.js";
 import { readCache, writeCache } from "./cache.js";
 
 /* ------------------------------------------------------------------ */
+/*  Response helper — deduplicates query filtering + formatting        */
+/* ------------------------------------------------------------------ */
+
+function respond(symbols: PublicSymbol[], pkgName: string, version: string, description: string, query?: string) {
+  if (query) {
+    const found = symbols.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
+    if (found.length) {
+      return { content: [{ type: "text" as const, text: found.map(formatSymbolDetail).join("\n\n---\n\n") }] };
+    }
+    return { content: [{ type: "text" as const, text: `Symbol "${query}" not found.` }] };
+  }
+  return { content: [{ type: "text" as const, text: toSummary(symbols, pkgName, version, description) }] };
+}
+
+/* ------------------------------------------------------------------ */
 /*  MCP Server                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -86,16 +101,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const cached = readCache(info.name, info.version);
         if (cached) {
           const data = JSON.parse(cached);
-          if (query) {
-            const found = data.symbols?.filter((s: PublicSymbol) =>
-              s.name.toLowerCase().includes(query.toLowerCase())
-            );
-            if (found?.length) {
-              return { content: [{ type: "text", text: found.map(formatSymbolDetail).join("\n\n---\n\n") }] };
-            }
-            return { content: [{ type: "text", text: `Symbol "${query}" not found.` }] };
-          }
-          return { content: [{ type: "text", text: toSummary(data.symbols, info.name, info.version, info.description) }] };
+          return respond(data.symbols, info.name, info.version, info.description, query);
         }
 
         // 3. Fetch source from GitHub
@@ -130,17 +136,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (dtsSymbols.length > 0) {
               const merged = mergeSymbols(symbols, dtsSymbols);
               writeCache(info.name, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }));
-              if (query) {
-                const found = merged.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
-                return { content: [{ type: "text", text: found.length ? found.map(formatSymbolDetail).join("\n\n---\n\n") : `Symbol "${query}" not found.` }] };
-              }
-              return { content: [{ type: "text", text: toSummary(merged, info.name, info.version, info.description) }] };
+              return respond(merged, info.name, info.version, info.description, query);
             }
           }
         }
 
         // 6.5 DefinitelyTyped fallback — try @types/{name} if regular .d.ts failed
-        // (JS-only packages like express ship no .d.ts)
         const dtsTypesFallback = await fetchTypesFromDTs(info.name);
         if (dtsTypesFallback) {
           const dtsSymbols = parsePublicAPI(dtsTypesFallback);
@@ -148,27 +149,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const merged = mergeSymbols(symbols, dtsSymbols);
             const label = `${info.name} (types via @types/${info.name})`;
             writeCache(info.name, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }));
-            if (query) {
-              const found = merged.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
-              return { content: [{ type: "text", text: found.length ? found.map(formatSymbolDetail).join("\n\n---\n\n") : `Symbol "${query}" not found.` }] };
-            }
-            return { content: [{ type: "text", text: toSummary(merged, label, info.version, info.description) }] };
+            return respond(merged, label, info.version, info.description, query);
           }
         }
 
         // 7. Cache & respond
         writeCache(info.name, info.version, JSON.stringify({ symbols, fetchedAt: Date.now() }));
-
-        // 8. Respond
-        if (query) {
-          const found = symbols.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
-          if (found?.length) {
-            return { content: [{ type: "text", text: found.map(formatSymbolDetail).join("\n\n---\n\n") }] };
-          }
-          return { content: [{ type: "text", text: `Symbol "${query}" not found.` }] };
-        }
-
-        return { content: [{ type: "text", text: toSummary(symbols, info.name, info.version, info.description) }] };
+        return respond(symbols, info.name, info.version, info.description, query);
 
       } catch (err: any) {
         return {

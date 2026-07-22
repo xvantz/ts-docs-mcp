@@ -4,12 +4,26 @@
 
 import { join, dirname } from "path";
 import type { SourceFile } from "./types.js";
-import { fetchText, mapConcurrent } from "./registry.js";
+import { mapConcurrent, TIMEOUT } from "./registry.js";
+import { throttledFetch } from "./throttle.js";
 
 const MAX_RESOLVE_FILES = 20;
 const MAX_RESOLVE_DEPTH = 2;
 const CONCURRENCY = 5;
 const RE_EXPORT_RE = /export\s+(?:\*|{[^}]+?})\s+from\s+['"]([^'"]+)['"]/g;
+
+/** Auth header for GitHub raw requests (5000 req/hr instead of 60). */
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_HEADERS: Record<string, string> = GITHUB_TOKEN
+  ? { Authorization: `Bearer ${GITHUB_TOKEN}`, "User-Agent": "ts-docs-mcp/0.1" }
+  : { "User-Agent": "ts-docs-mcp/0.1" };
+
+/** Fetch from GitHub raw with optional auth. */
+async function fetchGitHubText(url: string): Promise<string> {
+  const res = await throttledFetch(url, { headers: GITHUB_HEADERS }, TIMEOUT);
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+  return res.text();
+}
 
 /* ------------------------------------------------------------------ */
 /*  Raw URL helpers                                                    */
@@ -30,7 +44,7 @@ function buildRawURLs(owner: string, repo: string, ref: string, path: string): s
 async function tryFetchRaw(urls: string[]): Promise<string | null> {
   for (const url of urls) {
     try {
-      const text = await fetchText(url);
+      const text = await fetchGitHubText(url);
       // GitHub raw returns HTTP 200 with "404: Not Found\n" body for missing files
       if (text.length > 15 && !text.startsWith("404:")) return text;
     } catch { /* try next ref */ }
