@@ -162,7 +162,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const dtsSymbols = parsePublicAPI(dtsContent);
             if (dtsSymbols.length > 0) {
               const merged = mergeSymbols(symbols, dtsSymbols);
-              writeCache(label, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }), subpath);
+              writeCache(label, info.version, JSON.stringify({ symbols: merged }), subpath);
               return respond(merged, label, info.version, info.description, query);
             }
           }
@@ -175,13 +175,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (dtsSymbols.length > 0) {
             const merged = mergeSymbols(symbols, dtsSymbols);
             const dtLabel = `${label} (types via @types/${info.name})`;
-            writeCache(dtLabel, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }), subpath);
+            writeCache(dtLabel, info.version, JSON.stringify({ symbols: merged }), subpath);
             return respond(merged, dtLabel, info.version, info.description, query);
           }
         }
 
         // 8. Cache & respond
-        writeCache(label, info.version, JSON.stringify({ symbols, fetchedAt: Date.now() }), subpath);
+        writeCache(label, info.version, JSON.stringify({ symbols }), subpath);
         return respond(symbols, label, info.version, info.description, query);
 
       } catch (err: any) {

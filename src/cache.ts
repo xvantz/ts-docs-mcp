@@ -1,13 +1,13 @@
 /* ------------------------------------------------------------------ */
-/*  Cache — file-based caching with TTL and XDG path                  */
+/*  Cache — file-based cache with LRU-like eviction (7d no-access)    */
 /* ------------------------------------------------------------------ */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, statSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-const TTL_MS = 24 * 60 * 60 * 1000;     // 24 hours
-const CLEANUP_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+/** Package version data is immutable — no TTL. Evict only after 7 days of no access. */
+const EVICT_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** XDG-compatible cache directory. */
 function cacheDir(): string {
@@ -16,6 +16,12 @@ function cacheDir(): string {
 }
 
 export const CACHE_DIR = cacheDir();
+
+interface CacheEntry {
+  data: string;               // serialized symbol data
+  version: string;            // package version for verification
+  lastAccessed: number;       // timestamp of last read
+}
 
 function cacheKey(pkg: string, version: string, subpath?: string): string {
   const base = `${pkg}@${version}`;
@@ -27,49 +33,63 @@ function cachePath(key: string): string {
   return join(CACHE_DIR, `${key}.json`);
 }
 
-/** Read cached data for a package version. Returns null if missing or expired. */
+/** Read cached data. Updates `lastAccessed` on hit so LRU eviction works. Returns null if missing. */
 export function readCache(pkg: string, version: string, subpath?: string): string | null {
   const p = cachePath(cacheKey(pkg, version, subpath));
   if (!existsSync(p)) return null;
 
   try {
-    const stat = statSync(p);
-    const age = Date.now() - stat.mtimeMs;
-    if (age > TTL_MS) {
-      // Stale — delete and return null so it's re-fetched
-      try { rmSync(p); } catch { /* best effort */ }
-      return null;
-    }
-    return readFileSync(p, "utf-8");
+    const raw = readFileSync(p, "utf-8");
+    const entry: CacheEntry = JSON.parse(raw);
+
+    // Touch lastAccessed so LRU eviction knows this entry is active
+    entry.lastAccessed = Date.now();
+    writeFileSync(p, JSON.stringify(entry), "utf-8");
+
+    return entry.data;
   } catch {
+    // Corrupt cache — remove and return null
+    try { rmSync(p, { force: true }); } catch { /* best effort */ }
     return null;
   }
 }
 
-/** Write package documentation to cache. Cleans old entries periodically. */
+/** Write package documentation to cache. */
 export function writeCache(pkg: string, version: string, data: string, subpath?: string): void {
   if (!existsSync(CACHE_DIR)) {
     mkdirSync(CACHE_DIR, { recursive: true });
   }
-  writeFileSync(cachePath(cacheKey(pkg, version, subpath)), data, "utf-8");
 
-  // Probabilistic cleanup: ~5% chance per write to avoid perf hit
+  const entry: CacheEntry = {
+    data,
+    version,
+    lastAccessed: Date.now(),
+  };
+
+  writeFileSync(cachePath(cacheKey(pkg, version, subpath)), JSON.stringify(entry), "utf-8");
+
+  // Probabilistic cleanup: ~5% chance per write to avoid perf hit on large dirs
   if (Math.random() < 0.05) {
     cleanup();
   }
 }
 
-/** Remove cache entries older than CLEANUP_MS. */
+/** Remove entries not accessed in EVICT_AFTER_MS. */
 function cleanup(): void {
   if (!existsSync(CACHE_DIR)) return;
   const now = Date.now();
+
   for (const entry of readdirSync(CACHE_DIR)) {
     const full = join(CACHE_DIR, entry);
     try {
-      const stat = statSync(full);
-      if (stat.isFile() && now - stat.mtimeMs > CLEANUP_MS) {
-        rmSync(full);
+      const raw = readFileSync(full, "utf-8");
+      const cache: CacheEntry = JSON.parse(raw);
+      if (now - cache.lastAccessed > EVICT_AFTER_MS) {
+        rmSync(full, { force: true });
       }
-    } catch { /* skip */ }
+    } catch {
+      // Can't parse — delete corrupt entry
+      try { rmSync(full, { force: true }); } catch { /* skip */ }
+    }
   }
 }
