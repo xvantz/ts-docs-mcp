@@ -20,7 +20,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { PublicSymbol } from "./types.js";
-import { getPackageInfo, fetchSourceFile, fetchSourceContent, resolveSource, fetchDtsFromTarball } from "./registry.js";
+import { getPackageInfo, fetchSourceFile, fetchSourceContent, resolveSource, fetchDtsFromTarball, fetchTypesFromDTs } from "./registry.js";
 import { parsePublicAPI } from "./parser.js";
 import { toSummary, formatSymbolDetail, mergeSymbols } from "./format.js";
 import { readCache, writeCache } from "./cache.js";
@@ -134,6 +134,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
               return { content: [{ type: "text", text: toSummary(merged, info.name, info.version, info.description) }] };
             }
+          }
+        }
+
+        // 6.5 DefinitelyTyped fallback — try @types/{name} if regular .d.ts failed
+        // (JS-only packages like express ship no .d.ts)
+        const dtsTypesFallback = await fetchTypesFromDTs(info.name);
+        if (dtsTypesFallback) {
+          const dtsSymbols = parsePublicAPI(dtsTypesFallback);
+          if (dtsSymbols.length > 0) {
+            const merged = mergeSymbols(symbols, dtsSymbols);
+            const label = `${info.name} (types via @types/${info.name})`;
+            writeCache(info.name, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }));
+            if (query) {
+              const found = merged.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
+              return { content: [{ type: "text", text: found.length ? found.map(formatSymbolDetail).join("\n\n---\n\n") : `Symbol "${query}" not found.` }] };
+            }
+            return { content: [{ type: "text", text: toSummary(merged, label, info.version, info.description) }] };
           }
         }
 

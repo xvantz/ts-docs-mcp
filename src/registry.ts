@@ -379,3 +379,38 @@ export async function fetchDtsFromTarball(
   } catch (e: any) { console.error("[ts-docs-mcp] tarball error:", e.message); return null; }
   finally { rmSync(tmpDir, { recursive: true, force: true }); }
 }
+
+/* ------------------------------------------------------------------ */
+/*  DefinitelyTyped fallback                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * When a package ships no .d.ts files (JS-only, e.g. express),
+ * try fetching types from @types/{name} on npm.
+ * Returns concatenated .d.ts content, or null.
+ */
+export async function fetchTypesFromDTs(originalName: string): Promise<string | null> {
+  // npm encodes scoped packages as @scope__name in the @types namespace
+  // e.g. @prisma/client → @types/prisma__client
+  const typesName = originalName.startsWith("@")
+    ? `@types/${originalName.slice(1).replace("/", "__")}`
+    : `@types/${originalName}`;
+
+  let data: any;
+  try {
+    data = await fetchJSON(`${NPM_REGISTRY}/${encodeURIComponent(typesName)}`);
+  } catch {
+    return null; // @types/{name} doesn't exist
+  }
+
+  const version = data["dist-tags"]?.latest;
+  if (!version) return null;
+
+  const v = data.versions?.[version];
+  const tarballUrl = v?.dist?.tarball;
+  const typesHint = v?.types ?? v?.typings ?? "index.d.ts";
+  if (!tarballUrl) return null;
+
+  console.error(`[ts-docs-mcp] falling back to ${typesName}@${version}`);
+  return fetchDtsFromTarball(tarballUrl, typesHint);
+}
