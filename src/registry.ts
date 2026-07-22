@@ -14,15 +14,45 @@ import { throttledFetch } from "./throttle.js";
 /* ------------------------------------------------------------------ */
 
 const NPM_REGISTRY = "https://registry.npmjs.org";
+const MAX_RESOLVE_FILES = 20;
+const MAX_RESOLVE_DEPTH = 2;
+const CONCURRENCY = 5;
+const RE_EXPORT_RE = /export\s+(?:\*|{[^}]+?})\s+from\s+['"]([^'"]+)['"]/g;
+
+/* ------------------------------------------------------------------ */
+/*  Concurrency helper                                                 */
+/* ------------------------------------------------------------------ */
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency: number
+): Promise<R[]> {
+  const results: (R | undefined)[] = new Array(items.length);
+  let nextIdx = 0;
+
+  const worker = async () => {
+    while (nextIdx < items.length) {
+      const idx = nextIdx++;
+      results[idx] = await fn(items[idx]);
+    }
+  };
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results as R[];
+}
 
 /* ------------------------------------------------------------------ */
 /*  HTTP helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+const TIMEOUT = 10_000;
+
 async function fetchJSON(url: string): Promise<any> {
   const res = await throttledFetch(url, {
-    headers: { "Accept": "application/json", "User-Agent": "ts-docs-mcp/0.1" },
-  });
+    headers: { Accept: "application/json", "User-Agent": "ts-docs-mcp/0.1" },
+  }, TIMEOUT);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
   return res.json();
 }
@@ -30,7 +60,7 @@ async function fetchJSON(url: string): Promise<any> {
 async function fetchText(url: string): Promise<string> {
   const res = await throttledFetch(url, {
     headers: { "User-Agent": "ts-docs-mcp/0.1" },
-  });
+  }, TIMEOUT);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
   return res.text();
 }
@@ -57,7 +87,7 @@ function extractTypesHint(exports: any): string | null {
 export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   const data = await fetchJSON(`${NPM_REGISTRY}/${encodeURIComponent(pkg)}`);
   const version = data["dist-tags"]?.latest;
-  if (!version) throw new Error("No latest version found");
+  if (!version) throw new Error(`No latest version for "${pkg}"`);
 
   const v = data.versions?.[version];
   const description = v?.description ?? data.description ?? "";
@@ -67,7 +97,7 @@ export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   const repoStr = typeof repo === "string" ? repo : repo?.url ?? "";
   let match = repoStr.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
   if (!match) match = repoStr.match(/^([\w.-]+)\/([\w.-]+)$/);
-  if (!match) throw new Error("Not a GitHub repository");
+  if (!match) throw new Error(`"${pkg}": not a GitHub repository`);
 
   const owner = match[1];
   const repoName = match[2];
@@ -85,7 +115,7 @@ export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   }
   if (!sourceHint && v?.source) sourceHint = v.source;
 
-  // Get types file hint (for .d.ts fallback) — try nested exports conditions
+  // Get types file hint (for .d.ts fallback)
   const typesHint: string | null =
     v?.types ?? v?.typings ?? extractTypesHint(v?.exports?.["."]) ?? null;
   const tarballUrl: string | null = v?.dist?.tarball ?? null;
@@ -97,6 +127,28 @@ export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
 /*  GitHub source fetching                                             */
 /* ------------------------------------------------------------------ */
 
+/** Build GitHub raw URLs to try for a given ref and path. */
+function buildRawURLs(owner: string, repo: string, ref: string, path: string): string[] {
+  const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
+  const branches = ["main", "master"];
+  const urls: string[] = [];
+  for (const r of [...refs, ...branches]) {
+    urls.push(`https://raw.githubusercontent.com/${owner}/${repo}/${r}/${path}`);
+  }
+  return urls;
+}
+
+/** Try to fetch a file from GitHub raw by trying multiple refs. */
+async function tryFetchRaw(urls: string[]): Promise<string | null> {
+  for (const url of urls) {
+    try {
+      const text = await fetchText(url);
+      if (text.length > 30 && !text.startsWith("404")) return text;
+    } catch { /* try next ref */ }
+  }
+  return null;
+}
+
 /** Try multiple source URL patterns and return the first that resolves. */
 export async function fetchSourceFile(
   owner: string, repo: string, ref: string, hint: string | null,
@@ -107,17 +159,16 @@ export async function fetchSourceFile(
   const paths: string[] = [];
   if (hint) {
     const cleanHint = hint.replace(/^\.\//, "");
-    paths.push(cleanHint); // as-is
-    paths.push(`packages/${repo}/${cleanHint}`); // monorepo: packages/repo/
-    paths.push(`packages/${pkgDir}/${cleanHint}`); // monorepo: packages/name/
-    paths.push(`lib/${cleanHint}`); // lib/ prefix
+    paths.push(cleanHint);
+    paths.push(`packages/${repo}/${cleanHint}`);
+    paths.push(`packages/${pkgDir}/${cleanHint}`);
+    paths.push(`lib/${cleanHint}`);
   }
   paths.push(
     "src/index.ts", "lib/index.ts",
     "lib/index.js", "lib/main.js",
     "src/index.js", "src/main.js",
     "index.ts", "index.js",
-    // Try package name as filename: fastify.js, express.js
     `${pkgDir}.ts`, `${pkgDir}.js`,
     `${repo}.ts`, `${repo}.js`,
     `lib/${pkgDir}.js`, `lib/${pkgDir}.ts`,
@@ -133,21 +184,12 @@ export async function fetchSourceFile(
     "packages/core/src/index.ts",
   );
 
-  // Try tag refs first, then fallback to default branch
-  const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
-  const branches = ["main", "master"];
-  for (const r of [...refs, ...branches]) {
-    for (const p of paths) {
-      const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${p}`;
-      try {
-        const content = await fetchText(url);
-        // GitHub raw returns 200 with "404: Not Found" body for missing files
-        if (content.length > 50 && !content.startsWith("404")) {
-          return { content, path: p };
-        }
-      } catch {}
-    }
+  for (const p of paths) {
+    const urls = buildRawURLs(owner, repo, ref, p);
+    const content = await tryFetchRaw(urls);
+    if (content) return { content, path: p };
   }
+
   return null;
 }
 
@@ -155,54 +197,64 @@ export async function fetchSourceFile(
 export async function fetchSourceContent(
   owner: string, repo: string, ref: string, path: string
 ): Promise<string | null> {
-  const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
-  for (const r of refs) {
-    const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${path}`;
-    try {
-      const text = await fetchText(url);
-      return text;
-    } catch {}
-  }
-  return null;
+  const urls = buildRawURLs(owner, repo, ref, path);
+  return tryFetchRaw(urls);
 }
 
-/** Follow re-exports in a TS source file to find the actual declarations. */
+/** Resolve re-exports in a single file and return referenced file paths (relative). */
+async function resolveReExports(
+  owner: string, repo: string, ref: string, path: string, visited: Set<string>, depth: number
+): Promise<string[]> {
+  if (depth > MAX_RESOLVE_DEPTH) return [];
+
+  const content = await fetchSourceContent(owner, repo, ref, path);
+  if (!content) return [];
+
+  const found: string[] = [];
+  let match: RegExpExecArray | null;
+
+  const re = new RegExp(RE_EXPORT_RE.source, "g");
+  while ((match = re.exec(content)) !== null) {
+    const importPath = match[1];
+    const normalized = importPath.replace(/\.js$/, ".ts").replace(/\.ts$/, "");
+    const baseDir = dirname(path);
+    const resolved = join(baseDir, `${normalized}.ts`).replace(/^\.\//, "");
+
+    if (!visited.has(resolved) && found.length < MAX_RESOLVE_FILES) {
+      visited.add(resolved);
+      found.push(resolved);
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Follow re-exports to find all actual declaration files.
+ * Uses BFS with parallel fetch per level.
+ */
 export async function resolveSource(
   owner: string, repo: string, ref: string, startPath: string, visited = new Set<string>()
 ): Promise<string[]> {
   const files: string[] = [startPath];
+  visited.add(startPath);
 
-  const resolveLevel = async (path: string, depth: number): Promise<void> => {
-    if (depth > 2 || files.length >= 15) return;
-    const content = await fetchSourceContent(owner, repo, ref, path);
-    if (!content) return;
+  // BFS — process one depth level at a time, parallel within level
+  let currentLevel: string[] = [startPath];
+  let depth = 0;
 
-    const reExportRegex = /export\s+(?:\*|{[^}]+})\s+from\s+["']([^"']+)["']/g;
-    let match;
-    let count = 0;
-    while ((match = reExportRegex.exec(content)) !== null) {
-      count++;
-      if (files.length >= 15) break;
-      const importPath = match[1];
-      const normalized = importPath.replace(/\.js$/, ".ts").replace(/\.ts$/, "");
-      const baseDir = dirname(path);
-      const resolved = join(baseDir, `${normalized}.ts`).replace(/^\.\//, "");
+  while (currentLevel.length > 0 && files.length < MAX_RESOLVE_FILES && depth <= MAX_RESOLVE_DEPTH) {
+    const results = await mapConcurrent(currentLevel, (path) =>
+      resolveReExports(owner, repo, ref, path, visited, depth),
+    CONCURRENCY);
 
-      if (visited.has(resolved)) continue;
-      visited.add(resolved);
+    const nextLevel = results.flat();
+    const capped = nextLevel.slice(0, MAX_RESOLVE_FILES - files.length);
+    files.push(...capped);
+    currentLevel = capped;
+    depth++;
+  }
 
-      try {
-        const content = await fetchSourceContent(owner, repo, ref, resolved);
-        if (content) {
-          files.push(resolved);
-          await resolveLevel(resolved, depth + 1);
-        }
-      } catch {}
-    }
-    if (count === 0) return;
-  };
-
-  await resolveLevel(startPath, 1);
   return files;
 }
 
@@ -210,19 +262,19 @@ export async function resolveSource(
 /*  Tarball fallback                                                   */
 /* ------------------------------------------------------------------ */
 
-/** Resolve an import path like "./foo" or "./foo.js" to the actual .d.ts file path. */
+const DTS_EXT_MAP: Record<string, string[]> = {
+  ".js": [".d.ts", ".d.cts", ".d.mts"],
+  ".mjs": [".d.mts", ".d.ts"],
+  ".cjs": [".d.cts", ".d.ts"],
+  ".ts": [".d.ts"],
+  "": [".d.ts", "/index.d.ts", "/index.d.cts"],
+};
+
+/** Resolve an import path like "./foo" or "./foo.js" to the actual .d.ts file. */
 function resolveDTsPath(currentFile: string, importPath: string): string | null {
   const baseDir = dirname(currentFile);
 
-  const extMap: Record<string, string[]> = {
-    ".js": [".d.ts", ".d.cts", ".d.mts"],
-    ".mjs": [".d.mts", ".d.ts"],
-    ".cjs": [".d.cts", ".d.ts"],
-    ".ts": [".d.ts"],
-    "": [".d.ts", "/index.d.ts", "/index.d.cts"],
-  };
-
-  for (const [ext, candidates] of Object.entries(extMap)) {
+  for (const [ext, candidates] of Object.entries(DTS_EXT_MAP)) {
     let base = importPath;
     if (ext && importPath.endsWith(ext)) {
       base = importPath.slice(0, -ext.length);
@@ -236,26 +288,24 @@ function resolveDTsPath(currentFile: string, importPath: string): string | null 
     }
 
     if (ext === "") {
-      for (const _ of candidates) {
-        if (existsSync(join(baseDir, base + "/index.d.ts"))) return join(baseDir, base + "/index.d.ts");
-        if (existsSync(join(baseDir, base + "/index.d.cts"))) return join(baseDir, base + "/index.d.cts");
-      }
+      if (existsSync(join(baseDir, base + "/index.d.ts"))) return join(baseDir, base + "/index.d.ts");
+      if (existsSync(join(baseDir, base + "/index.d.cts"))) return join(baseDir, base + "/index.d.cts");
     }
   }
 
   return null;
 }
 
-/** Follow imports/re-exports in a .d.ts file to collect all referenced files from extracted tarball. */
+/** Follow imports/re-exports in a .d.ts file to collect all referenced files. */
 function collectDTsFiles(root: string, entryPath: string, visited: Set<string>): string[] {
   if (visited.has(entryPath)) return [];
   visited.add(entryPath);
   const files: string[] = [entryPath];
 
   const content = readFileSync(entryPath, "utf-8");
-
-  const importRegex = /(?:import|export)\s+(?:\*|{[^}]+}|\w+(?:\s*,\s*\w+)?)\s+from\s+["']([^"']+)["']/g;
+  const importRegex = /(?:import|export)\s+(?:\*|{[^}]+}|\w+(?:\s*,\s*\w+)?)\s+from\s+['"]([^'"]+)['"]/g;
   let match: RegExpExecArray | null;
+
   while ((match = importRegex.exec(content)) !== null) {
     if (files.length >= 50) break;
     const importPath = match[1];
@@ -271,7 +321,10 @@ function collectDTsFiles(root: string, entryPath: string, visited: Set<string>):
   return files;
 }
 
-/** Download npm tarball, extract .d.ts files, follow re-exports. Returns concatenated content. */
+/**
+ * Download npm tarball, extract .d.ts files, follow re-exports.
+ * Returns concatenated content.
+ */
 export async function fetchDtsFromTarball(
   tarballUrl: string, typesPath: string | null
 ): Promise<string | null> {
@@ -280,7 +333,9 @@ export async function fetchDtsFromTarball(
   const tgzPath = join(tmpDir, "pkg.tgz");
 
   try {
-    const res = await throttledFetch(tarballUrl, { headers: { "User-Agent": "ts-docs-mcp/0.1" } });
+    const res = await throttledFetch(tarballUrl, {
+      headers: { "User-Agent": "ts-docs-mcp/0.1" },
+    }, 15_000);
     if (!res.ok) { console.error("[ts-docs-mcp] tarball fetch failed:", res.status); return null; }
     const buffer = Buffer.from(await res.arrayBuffer());
     writeFileSync(tgzPath, buffer);
