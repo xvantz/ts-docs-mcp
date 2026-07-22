@@ -11,6 +11,12 @@
     "dist/index.d.ts",
     "dist/registry.js",
     "dist/registry.d.ts",
+    "dist/github.js",
+    "dist/github.d.ts",
+    "dist/tarball.js",
+    "dist/tarball.d.ts",
+    "dist/jsdoc.js",
+    "dist/jsdoc.d.ts",
     "dist/parser.js",
     "dist/parser.d.ts",
     "dist/format.js",
@@ -18,7 +24,9 @@
     "dist/cache.js",
     "dist/cache.d.ts",
     "dist/throttle.js",
-    "dist/throttle.d.ts"
+    "dist/throttle.d.ts",
+    "dist/types.js",
+    "dist/types.d.ts"
   ],
   "scripts": {
     "build": "tsc",
