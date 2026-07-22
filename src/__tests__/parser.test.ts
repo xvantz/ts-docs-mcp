@@ -117,13 +117,18 @@ function createApplication() {
     expect(symbols[0].name).toBe("createApplication");
   });
 
-  it("skips symbols without JSDoc", () => {
+  it("captures symbols even without JSDoc", () => {
     const source = `
 export const foo = 1;
 export function bar() {}
 `;
     const symbols = parsePublicAPI(source);
-    expect(symbols).toHaveLength(0);
+    expect(symbols).toHaveLength(2);
+    expect(symbols[0].name).toBe("foo");
+    expect(symbols[0].kind).toBe("variable");
+    expect(symbols[0].jsdoc).toBe("");
+    expect(symbols[1].name).toBe("bar");
+    expect(symbols[1].kind).toBe("function");
   });
 
   it("parses multiple symbols", () => {
