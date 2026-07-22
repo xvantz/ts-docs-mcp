@@ -66,7 +66,7 @@ interface PackageInfo {
   tarballUrl: string | null;
 }
 
-async function getPackageInfo(pkg: string): Promise<PackageInfo> {
+export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   const data = await fetchJSON(`${NPM_REGISTRY}/${encodeURIComponent(pkg)}`);
   const version = data["dist-tags"]?.latest;
   if (!version) throw new Error("No latest version found");
@@ -97,8 +97,9 @@ async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   }
   if (!sourceHint && v?.source) sourceHint = v.source;
 
-  // Get types file hint (for .d.ts fallback)
-  const typesHint: string | null = v?.types ?? v?.typings ?? v?.exports?.["."]?.types ?? null;
+  // Get types file hint (for .d.ts fallback) — try nested exports conditions
+  const typesHint: string | null =
+    v?.types ?? v?.typings ?? extractTypesHint(v?.exports?.["."]) ?? null;
   const tarballUrl: string | null = v?.dist?.tarball ?? null;
 
   return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint, typesHint, tarballUrl };
@@ -205,8 +206,95 @@ async function resolveSource(
 /*  Tarball fallback                                                   */
 /* ------------------------------------------------------------------ */
 
-/** Download npm tarball and extract .d.ts file for the package. */
-async function fetchDtsFromTarball(tarballUrl: string, typesPath: string): Promise<string | null> {
+/** Find types entry from nested exports map. */
+function extractTypesHint(exports: any): string | null {
+  if (!exports || typeof exports !== "object") return null;
+  if (typeof exports === "string") return exports;
+  if (exports.types && typeof exports.types === "string") return exports.types;
+  for (const key of ["import", "require", "default", "node", "browser"]) {
+    if (exports[key]) {
+      const found = extractTypesHint(exports[key]);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/** Follow re-exports AND imports in a .d.ts file to collect all referenced files from extracted tarball. */
+function collectDTsFiles(
+  root: string, entryPath: string, visited: Set<string>
+): string[] {
+  if (visited.has(entryPath)) return [];
+  visited.add(entryPath);
+  const files: string[] = [entryPath];
+
+  const content = readFileSync(entryPath, "utf-8");
+
+  // Collect all relative import/re-export targets
+  // Matches: import ... from "..."  and  export ... from "..."
+  const importRegex = /(?:import|export)\s+(?:\*|{[^}]+}|\w+(?:\s*,\s*\w+)?)\s+from\s+["']([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+  while ((match = importRegex.exec(content)) !== null) {
+    if (files.length >= 50) break;
+    const importPath = match[1];
+
+    // Skip external packages (not relative)
+    if (!importPath.startsWith(".")) continue;
+
+    // Resolve to .d.ts/.d.cts/.d.mts
+    const resolved = resolveDTsPath(entryPath, importPath);
+    if (resolved && existsSync(resolved) && !visited.has(resolved)) {
+      const nested = collectDTsFiles(root, resolved, visited);
+      files.push(...nested);
+    }
+  }
+
+  return files;
+}
+
+/** Resolve an import path like "./foo" or "./foo.js" to the actual .d.ts file path. */
+function resolveDTsPath(currentFile: string, importPath: string): string | null {
+  const baseDir = dirname(currentFile);
+
+  // Extension mappings for CJS/ESM type declarations
+  const extMap: Record<string, string[]> = {
+    ".js": [".d.ts", ".d.cts", ".d.mts"],
+    ".mjs": [".d.mts", ".d.ts"],
+    ".cjs": [".d.cts", ".d.ts"],
+    ".ts": [".d.ts"],
+    "": [".d.ts", "/index.d.ts", "/index.d.cts"],
+  };
+
+  for (const [ext, candidates] of Object.entries(extMap)) {
+    let base = importPath;
+    if (ext && importPath.endsWith(ext)) {
+      base = importPath.slice(0, -ext.length);
+    } else if (ext) {
+      continue; // extension doesn't match, try next
+    }
+
+    for (const candidate of candidates) {
+      const target = join(baseDir, base + candidate);
+      if (existsSync(target)) return target;
+    }
+
+    // Also try directory index files (foo/index.d.ts, foo/index.d.cts)
+    if (ext === "") {
+      for (const cand of candidates) {
+        const dirTarget = join(baseDir, base + "/index.d.ts");
+        if (existsSync(dirTarget)) return dirTarget;
+        if (existsSync(join(baseDir, base + "/index.d.cts"))) return join(baseDir, base + "/index.d.cts");
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Download npm tarball, extract .d.ts files, follow re-exports. */
+export async function fetchDtsFromTarball(
+  tarballUrl: string, typesPath: string | null
+): Promise<string | null> {
   const tmpDir = join(CACHE_DIR, `.tmp-tgz-${Date.now()}`);
   mkdirSync(tmpDir, { recursive: true });
   const tgzPath = join(tmpDir, "pkg.tgz");
@@ -219,14 +307,42 @@ async function fetchDtsFromTarball(tarballUrl: string, typesPath: string): Promi
 
     execSync(`tar xzf "${tgzPath}" -C "${tmpDir}" --strip-components=1 2>/dev/null`, { stdio: "pipe", timeout: 15000 });
 
-    const cleanPath = typesPath.replace(/^\.\//, "");
-    const dtsFile = join(tmpDir, cleanPath);
-    if (existsSync(dtsFile)) return readFileSync(dtsFile, "utf-8");
+    const visited = new Set<string>();
+    const collected: string[] = [];
 
-    const files = execSync(`find "${tmpDir}" -name '*.d.ts' -not -path '*/node_modules/*' 2>/dev/null | head -5`, { encoding: "utf-8" }).trim().split("\n");
-    for (const f of files) { if (f) return readFileSync(f, "utf-8"); }
-    console.error("[ts-docs-mcp] no .d.ts found in tarball");
-    return null;
+    if (typesPath) {
+      const cleanPath = typesPath.replace(/^\.\//, "");
+      const entry = join(tmpDir, cleanPath);
+      if (existsSync(entry)) {
+        collected.push(...collectDTsFiles(tmpDir, entry, visited));
+      }
+    }
+
+    // If typesPath didn't yield anything, scan all .d.ts files
+    if (collected.length === 0) {
+      const allFiles = execSync(
+        `find "${tmpDir}" -name '*.d.ts' -o -name '*.d.cts' -o -name '*.d.mts' 2>/dev/null | head -50`,
+        { encoding: "utf-8" }
+      ).trim().split("\n").filter(Boolean);
+      for (const f of allFiles) {
+        if (visited.has(f)) continue;
+        collected.push(f);
+        visited.add(f);
+      }
+    }
+
+    if (collected.length === 0) {
+      console.error("[ts-docs-mcp] no .d.ts found in tarball");
+      return null;
+    }
+
+    // Concat all collected files
+    const parts: string[] = [];
+    for (const f of collected) {
+      parts.push(`// ${f.replace(tmpDir, "")}`);
+      parts.push(readFileSync(f, "utf-8"));
+    }
+    return parts.join("\n");
   } catch (e: any) { console.error("[ts-docs-mcp] tarball error:", e.message); return null; }
   finally { rmSync(tmpDir, { recursive: true, force: true }); }
 }
@@ -259,7 +375,7 @@ interface PublicSymbol {
 }
 
 /** Parse JSDoc + declarations from TypeScript source code. */
-function parsePublicAPI(source: string): PublicSymbol[] {
+export function parsePublicAPI(source: string): PublicSymbol[] {
   const symbols: PublicSymbol[] = [];
   const lines = source.split("\n");
 
@@ -455,49 +571,67 @@ function parseMethods(source: string, className: string): { name: string; jsdoc:
 /*  Markdown formatting                                                */
 /* ------------------------------------------------------------------ */
 
-function toSummary(symbols: PublicSymbol[], pkgName: string, version: string, description: string): string {
+/** Clean a raw signature for display: remove leading 'export ', collapse whitespace, truncate. */
+function cleanSignature(sig: string, maxLen = 120): string {
+  return sig
+    .replace(/^export\s+/, "")
+    .replace(/^(declare\s+)?(async\s+)?/, "")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+/** Show a compact one-line entry for a symbol in the summary list. */
+function symbolLine(item: PublicSymbol): string {
+  // Clean signature snippet for context
+  const snippet = cleanSignature(item.signature, 80);
+
+  if (item.deprecation) {
+    const reason = item.deprecation.replace(/\s*@deprecated\s*/g, "").slice(0, 100);
+    return `- ⚠️ **${item.name}** — *Deprecated:* ${reason}`;
+  }
+
+  if (item.jsdoc) {
+    const firstLine = item.jsdoc.replace(/\n/g, " ").slice(0, 200);
+    return `- **${item.name}** — ${firstLine}`;
+  }
+
+  // No JSDoc — show clean signature
+  return `- \`${item.name}\` — ${snippet}`;
+}
+
+export function toSummary(symbols: PublicSymbol[], pkgName: string, version: string, description: string): string {
   const lines: string[] = [];
   lines.push(`# ${pkgName} API v${version}`);
   if (description) lines.push(`> ${description}`);
   lines.push("");
 
-  // Group by kind
-  const groups: Record<string, PublicSymbol[]> = {};
+  // Count totals per kind
+  const perKind: Record<string, PublicSymbol[]> = {};
   for (const s of symbols) {
-    if (!groups[s.kind]) groups[s.kind] = [];
-    if (groups[s.kind].length < 15) groups[s.kind].push(s);
+    if (!perKind[s.kind]) perKind[s.kind] = [];
+    perKind[s.kind].push(s);
   }
 
   const order = ["class", "interface", "function", "enum", "type", "variable"];
   for (const kind of order) {
-    const items = groups[kind];
-    if (!items?.length) continue;
+    const all = perKind[kind];
+    if (!all?.length) continue;
     const plural = kind === "class" ? "Classes" : kind === "interface" ? "Interfaces" : kind === "function" ? "Functions" : kind === "type" ? "Type Aliases" : kind === "variable" ? "Variables" : `${kind}s`;
-    lines.push(`## ${plural}\n`);
+    const maxShow = 15;
+    const items = all.slice(0, maxShow);
+    lines.push(`## ${plural} (${all.length})${all.length > maxShow ? ` — showing ${maxShow}` : ""}\n`);
 
     for (const item of items) {
-      // Show deprecation badge
-      if (item.deprecation) {
-        lines.push(`- ⚠️ **${item.name}** — *Deprecated:* ${item.deprecation.replace(/\s*@deprecated\s*/g, "").slice(0, 120)}`);
-        continue;
-      }
-
-      // Show JSDoc description
-      if (item.jsdoc) {
-        lines.push(`- **${item.name}**`);
-        lines.push(`  ${item.jsdoc.replace(/\n/g, " ").slice(0, 200)}`);
-        continue;
-      }
-
-      // Fallback: just the name
-      lines.push(`- \`${item.name}\``);
+      lines.push(symbolLine(item));
     }
     lines.push("");
   }
 
-  const shown = Object.values(groups).flat().length;
-  if (shown < symbols.length) {
-    lines.push(`*Showing ${shown} of ${symbols.length} symbols. Use \`query\` to find a specific symbol.*`);
+  const totalShown = Object.values(perKind).reduce((acc, arr) => acc + Math.min(arr.length, 15), 0);
+  if (totalShown < symbols.length) {
+    lines.push(`*Showing ${totalShown} of ${symbols.length} symbols. Use \`query\` to find a specific symbol.*`);
   }
 
   return lines.join("\n");
@@ -659,8 +793,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (dtsFile) dtsContent = dtsFile.content;
           }
 
-          // Try npm tarball if GitHub .d.ts failed
-          if (!dtsContent && info.tarballUrl && info.typesHint) {
+          // Try npm tarball if GitHub .d.ts failed or express (no typesHint)
+          if (!dtsContent && info.tarballUrl) {
             dtsContent = await fetchDtsFromTarball(info.tarballUrl, info.typesHint);
           }
 
