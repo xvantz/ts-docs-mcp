@@ -16,12 +16,14 @@ export function parsePublicAPI(source: string): PublicSymbol[] {
     // Detect JSDoc comment
     if (line.startsWith("/**")) {
       let jsdocLines: string[] = [];
-      while (i < lines.length && !lines[i].trim().startsWith("*/")) {
+      while (i < lines.length && !(
+        lines[i].trim().startsWith("*/") || lines[i].trim().endsWith("*/")
+      )) {
         jsdocLines.push(lines[i]);
         i++;
       }
       if (i < lines.length) {
-        jsdocLines.push(lines[i]); // include */
+        jsdocLines.push(lines[i]); // include the */ line
         i++;
       }
 
@@ -125,6 +127,9 @@ function parseMethods(source: string, className: string): { name: string; jsdoc:
         line.includes(`${className}: core.$constructor`)) {
       inBody = true;
       braceDepth = 0;
+      // count { on the declaration line
+      braceDepth += (line.match(/\{/g) || []).length;
+      braceDepth -= (line.match(/\}/g) || []).length;
       i++;
       continue;
     }
@@ -142,7 +147,9 @@ function parseMethods(source: string, className: string): { name: string; jsdoc:
         let jsdocLines: string[] = [];
         let j = i;
         if (line.startsWith("/**")) {
-          while (j < lines.length && !lines[j].trim().startsWith("*/")) {
+          while (j < lines.length && !(
+            lines[j].trim().startsWith("*/") || lines[j].trim().endsWith("*/")
+          )) {
             jsdocLines.push(lines[j]);
             j++;
           }

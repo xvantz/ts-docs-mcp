@@ -12,6 +12,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "test": "vitest run --exclude='src/**/*.int.test.ts'",
+    "test:integration": "vitest run src/**/*.int.test.ts",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -31,17 +34,11 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
-    "@types/express": "^5.0.6",
-    "drizzle-orm": "^0.45.2",
-    "express": "^5.2.1",
-    "fastify": "^5.10.0",
-    "shadcn": "^4.14.0",
-    "typedoc": "^0.28.0",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "^1.8.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.10"
   }
 }

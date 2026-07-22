@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "fs";
 import { join, dirname } from "path";
 import type { PackageInfo, SourceFile } from "./types.js";
 import { CACHE_DIR } from "./cache.js";
+import { throttledFetch } from "./throttle.js";
 
 /* ------------------------------------------------------------------ */
 /*  Config                                                             */
@@ -19,7 +20,7 @@ const NPM_REGISTRY = "https://registry.npmjs.org";
 /* ------------------------------------------------------------------ */
 
 async function fetchJSON(url: string): Promise<any> {
-  const res = await fetch(url, {
+  const res = await throttledFetch(url, {
     headers: { "Accept": "application/json", "User-Agent": "ts-docs-mcp/0.1" },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
@@ -27,7 +28,7 @@ async function fetchJSON(url: string): Promise<any> {
 }
 
 async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, {
+  const res = await throttledFetch(url, {
     headers: { "User-Agent": "ts-docs-mcp/0.1" },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
@@ -279,7 +280,7 @@ export async function fetchDtsFromTarball(
   const tgzPath = join(tmpDir, "pkg.tgz");
 
   try {
-    const res = await fetch(tarballUrl, { headers: { "User-Agent": "ts-docs-mcp/0.1" } });
+    const res = await throttledFetch(tarballUrl, { headers: { "User-Agent": "ts-docs-mcp/0.1" } });
     if (!res.ok) { console.error("[ts-docs-mcp] tarball fetch failed:", res.status); return null; }
     const buffer = Buffer.from(await res.arrayBuffer());
     writeFileSync(tgzPath, buffer);
