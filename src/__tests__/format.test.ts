@@ -125,4 +125,33 @@ describe("formatSymbolDetail", () => {
     expect(result).toContain("doStuff");
     expect(result).toContain("Does stuff");
   });
+
+  it("shows Parameters and Returns sections from JSDoc", () => {
+    const result = formatSymbolDetail(makeSymbol({
+      name: "findUser",
+      jsdoc: "Find a user.\n@param email - Email to search\n@returns User or null",
+    }));
+    expect(result).toContain("**Parameters:**");
+    expect(result).toContain("email - Email to search");
+    expect(result).toContain("**Returns:**");
+    expect(result).toContain("User or null");
+  });
+
+  it("shows full signature without truncation", () => {
+    const longSig = "export function extremelyLongFunctionName<T extends Record<string, unknown>>(options: ExtremelyLongOptionsType, callback: (err: Error | null, result: T) => void): Promise<T>";
+    const result = formatSymbolDetail(makeSymbol({
+      name: "extremelyLongFunctionName",
+      signature: longSig,
+    }));
+    expect(result).toContain(longSig);
+  });
+
+  it("includes namespace in summary when present", () => {
+    const symbols = [
+      makeSymbol({ name: "myLib", kind: "namespace" as const }),
+    ];
+    const result = toSummary(symbols, "pkg", "1.0.0", "");
+    expect(result).toContain("## Namespaces");
+    expect(result).toContain("myLib");
+  });
 });

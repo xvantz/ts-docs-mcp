@@ -20,7 +20,9 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { PublicSymbol } from "./types.js";
-import { getPackageInfo, fetchSourceFile, fetchSourceContent, resolveSource, fetchDtsFromTarball, fetchTypesFromDTs } from "./registry.js";
+import { getPackageInfo } from "./registry.js";
+import { fetchSourceFile, fetchSourceContent, resolveSource } from "./github.js";
+import { fetchDtsFromTarball, fetchTypesFromDTs } from "./tarball.js";
 import { parsePublicAPI } from "./parser.js";
 import { toSummary, formatSymbolDetail, mergeSymbols } from "./format.js";
 import { readCache, writeCache } from "./cache.js";

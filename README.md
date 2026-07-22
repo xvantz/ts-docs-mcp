@@ -30,49 +30,49 @@ Models *know about* libraries, but they don't know **which version you have inst
 
 `ts-docs-mcp` provides documentation sourced from **the actual package source code** — not training data.
 
+The pipeline:
+
 ```
-npm registry → GitHub raw (JSDoc) → npm tarball (.d.ts)
-```
-
-1. **Fetches the exact version** from the npm registry
-2. **Reads the TypeScript source** from GitHub, including JSDoc comments
-3. **Falls back to `.d.ts` files** from the npm tarball if GitHub source is a barrel
-4. **Returns clean Markdown** — every exported symbol, method signature, and deprecation notice
-
-The model gets:
-
-```markdown
-# drizzle-orm API v0.45.2
-> Drizzle ORM package for SQL databases
-
-## Functions (38) — showing 15
-
-- **join** — Join a list of SQL chunks with a separator.
-- **and** — Combine a list of conditions with the `and` operator.
-- **or** — Combine a list of conditions with the `or` operator.
-- **eq** — Test that two values are equal.
-...
+npm registry → GitHub .ts (JSDoc) → npm tarball (.d.ts) → DefinitelyTyped (@types/)
 ```
 
-**No stale training data. No hallucinated APIs. No node_modules needed.**
+1. **Resolves the exact version** from the npm registry
+2. **Reads TypeScript source** from GitHub, including JSDoc, `@param`, `@returns`
+3. **Follows re-exports** to find actual declarations (BFS, parallel fetches)
+4. **Falls back to `.d.ts`** from the npm tarball if GitHub source is insufficient
+5. **Falls back to DefinitelyTyped** for JS-only packages (express, etc.)
+6. **Returns clean Markdown** — full signatures, parameters, deprecation notices, examples
+
+### Before vs After
+
+| Package | Before (v0.1.0) | After (v0.4.1) |
+|---------|:-:|:-:|
+| **zod** | 31 symbols | **577** |
+| **axios** | 0 | **83** |
+| **uuid** | 0 | **23** |
+| **chalk** | 19 | **32** |
+| **fastify** | 51 | **~100+** |
+| **express** | 0 | **13** (via @types/express) |
 
 ---
 
 ## How It Works
 
 ```
-┌──────────────────┐       ┌────────────────────────────────────────┐
-│  AI Coding Agent │ ◄──── │          ts-docs-mcp                   │
-│  (Cursor, Claude │ MCP   │   (MCP Server via stdio)               │
-│   Code, etc.)    │       │                                        │
-└──────────────────┘       │  get_package_docs("zod")               │
-         │                  │    ↓                                  │
-         │   "Here is the  │  1. npm registry → package metadata    │
-         │   full Zod API  │  2. GitHub raw → JSDoc from source     │
-         │   documentation"│  3. npm tarball → .d.ts (fallback)     │
-         ▼                  │  4. Merge + dedup → Markdown           │
-  Writes correct code       │  5. Cache by version                  │
-                            └────────────────────────────────────────┘
+┌──────────────────┐       ┌──────────────────────────────────────────────┐
+│  AI Coding Agent │ ◄──── │          ts-docs-mcp                         │
+│  (Cursor, Claude │ MCP   │   (MCP Server via stdio)                     │
+│   Code, etc.)    │       │                                              │
+└──────────────────┘       │  get_package_docs("zod")                     │
+         │                  │    ↓                                        │
+         │   "Here is the  │  1. npm registry → package metadata          │
+         │   full API      │  2. GitHub raw → JSDoc from .ts source       │
+         │   documentation"│  3. BFS re-export resolution (parallel)      │
+         ▼                  │  4. npm tarball → .d.ts parsing (no JSDoc?) │
+  Writes correct code       │  5. @types/{name} fallback (JS-only)        │
+                            │  6. Merge + dedup → Markdown                │
+                            │  7. XDG cache (24h TTL)                     │
+                            └──────────────────────────────────────────────┘
 ```
 
 ### Tools
@@ -84,15 +84,38 @@ The model gets:
 ### Fallback chain
 
 ```
-GitHub .ts source (JSDoc)
-  → if 0 symbols: GitHub .d.ts
-    → if 0 symbols: npm tarball .d.ts (with re-export following)
-      → merge all results, dedup by name
+GitHub .ts (JSDoc + declarations)
+  → BFS re-export resolution (depth=2, concurrency=5)
+    → merge: GitHub .d.ts (from tarball, with re-export following)
+      → if 0 symbols: DefinitelyTyped (@types/{name})
+        → merge all results, dedup by name (GitHub takes priority)
 ```
+
+### What the model gets
+
+```markdown
+## findByEmail (function)
+> Find a user by their email address.
+> @param email — The email to search for
+> @returns The user object or null
+
+```typescript
+export function findByEmail(email: string, includeDeleted?: boolean): User | null;
+```
+
+**Parameters:**
+
+- `email — The email to search for`
+- `includeDeleted — Whether to include deleted users`
+
+**Returns:** `The user object or null`
+```
+
+Full signatures, no truncation. `@param`, `@returns`, `@deprecated`, `@example` are preserved.
 
 ### Cache
 
-Documentation is cached in `.llm-cache/` as JSON, keyed by `package@version`. Cache lives 24h.
+Documentation is cached in `~/.cache/ts-docs-mcp/` (XDG-compatible), keyed by `package@version`. TTL is 24 hours. Old entries are cleaned up after 7 days.
 
 ---
 
@@ -121,7 +144,7 @@ Add to your MCP configuration:
 
 - Node.js 20+
 - Internet access (fetches from npm registry, GitHub, npm tarballs)
-- Package must be on npm with a public GitHub repository
+- Package must be on npm with a public GitHub repository (or have @types/ types)
 
 ---
 
@@ -130,32 +153,18 @@ Add to your MCP configuration:
 **Get the full API overview:**
 
 ```
-You → "Show me the drizzle-orm API"
-
-Agent → calls get_package_docs("drizzle-orm")
-     → gets all exported symbols grouped by kind
+You → "Show me the axios API"
+Agent → calls get_package_docs("axios")
+     → gets 83 symbols: types, interfaces, classes, functions
 ```
 
 **Find a specific symbol:**
 
 ```
 You → "How do I use Zod's transform method?"
-
 Agent → calls get_package_docs("zod", query="transform")
-     → gets ZodEffects.transform with signature + JSDoc
+     → gets ZodEffects.transform with full signature + JSDoc
 ```
-
----
-
-## Tested Packages
-
-| Package | Source | Fallback | Merged |
-|---------|--------|----------|--------|
-| zod | 5 symbols (11 files) | 14 (tarball) | **14** |
-| drizzle-orm | 9 (15 files) | 50 (tarball) | **51** |
-| fastify | 1 | 51 (tarball) | **51** |
-| shadcn | — | 4 (tarball) | **4** |
-| express | 0 (JS-only) | — | **0** |
 
 ---
 
@@ -178,21 +187,23 @@ git clone https://git.827482.xyz/xvantz/ts-docs-mcp.git
 cd ts-docs-mcp
 npm install
 npm run build
-npm test          # 28 unit tests
-npm run test:integration  # network tests
+npm test          # 43 unit tests (5 test files)
+npm run test:integration  # network tests (skipped in CI)
 ```
 
 ### Project structure
 
 ```
 src/
-├── types.ts     — PackageInfo, PublicSymbol interfaces
-├── cache.ts     — file-based cache
-├── throttle.ts  — token-bucket rate limiter
-├── registry.ts  — npm registry, GitHub source, tarball fallback
-├── parser.ts    — JSDoc parser
-├── format.ts    — Markdown output
-└── index.ts     — MCP server (thin handler)
+├── registry.ts   — npm package metadata + HTTP helpers
+├── github.ts     — GitHub raw source fetching (BFS, parallel)
+├── tarball.ts    — .d.ts extraction from tarball + DefinitelyTyped
+├── parser.ts     — Two-phase JSDoc + declaration parser
+├── format.ts     — Markdown output (summary + detail)
+├── throttle.ts   — Per-endpoint token-bucket rate limiter
+├── cache.ts      — XDG file cache with 24h TTL
+├── types.ts      — PublicSymbol, PackageInfo interfaces
+└── index.ts      — MCP server (thin handler)
 ```
 
 ---

@@ -64,7 +64,7 @@ function tryConsume(b: Bucket): number {
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /** Pick endpoint name from URL. */
-function pickEndpoint(url: string): string {
+export function pickEndpoint(url: string): string {
   if (url.includes("registry.npmjs.org")) return "npm";
   if (url.includes("raw.githubusercontent.com")) return "github-raw";
   return "other";
