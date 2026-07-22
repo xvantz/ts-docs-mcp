@@ -61,6 +61,7 @@ interface PackageInfo {
   owner: string;
   repo: string;
   sourceHint: string | null;
+  typesHint: string | null;  // .d.ts path from package.json types field
 }
 
 async function getPackageInfo(pkg: string): Promise<PackageInfo> {
@@ -94,7 +95,10 @@ async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   }
   if (!sourceHint && v?.source) sourceHint = v.source;
 
-  return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint };
+  // Get types file hint (for .d.ts fallback)
+  const typesHint: string | null = v?.types ?? v?.typings ?? null;
+
+  return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint, typesHint };
 }
 
 /** Try multiple source URL patterns and return the first that resolves. */
@@ -611,6 +615,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const symbols = parsePublicAPI(allSource);
+
+        // 6. Fallback: if no JSDoc symbols found, try .d.ts from GitHub
+        if (symbols.length === 0 && info.typesHint) {
+          const dtsFile = await fetchSourceFile(info.owner, info.repo, info.version, info.typesHint, info.name);
+          if (dtsFile) {
+            const dtsSymbols = parsePublicAPI(dtsFile.content);
+            if (dtsSymbols.length > 0) {
+              let allDts = dtsFile.content;
+              const resolvedDts = await resolveSource(info.owner, info.repo, info.version, dtsFile.path, new Set());
+              for (const f of resolvedDts.slice(1)) {
+                const content = await fetchSourceContent(info.owner, info.repo, info.version, f);
+                if (content) allDts += "\n\n" + content;
+              }
+              const merged = [...symbols, ...dtsSymbols];
+              writeCache(info.name, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }));
+              if (query) {
+                const found = merged.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
+                return { content: [{ type: "text", text: found.length ? found.map(formatSymbolDetail).join("\n\n---\n\n") : `Symbol "${query}" not found.` }] };
+              }
+              return { content: [{ type: "text", text: toSummary(merged, info.name, info.version, info.description) }] };
+            }
+          }
+        }
 
         // 6. Cache
         writeCache(info.name, info.version, JSON.stringify({ symbols, fetchedAt: Date.now() }));
