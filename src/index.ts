@@ -117,11 +117,15 @@ async function fetchSourceFile(
     `packages/${repo}/src/index.ts`,
     `packages/${pkgDir}/src/index.ts`,
     `packages/${repo}/lib/index.ts`,
+    `${repo}/src/index.ts`,        // monorepo where package = repo name
+    `${pkgDir}/src/index.ts`,      // monorepo where package = pkg name
     "packages/core/src/index.ts",
   );
 
+  // Try tag refs first, then fallback to default branch
   const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
-  for (const r of refs) {
+  const branches = ["main", "master"];
+  for (const r of [...refs, ...branches]) {
     for (const p of paths) {
       const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${p}`;
       try {
@@ -405,10 +409,10 @@ function toSummary(symbols: PublicSymbol[], pkgName: string, version: string, de
   const groups: Record<string, PublicSymbol[]> = {};
   for (const s of symbols) {
     if (!groups[s.kind]) groups[s.kind] = [];
-    if (groups[s.kind].length < 12) groups[s.kind].push(s);
+    if (groups[s.kind].length < 15) groups[s.kind].push(s);
   }
 
-  const order = ["class", "interface", "enum", "function", "type", "variable"];
+  const order = ["class", "interface", "function", "enum", "type", "variable"];
   for (const kind of order) {
     const items = groups[kind];
     if (!items?.length) continue;
@@ -416,23 +420,28 @@ function toSummary(symbols: PublicSymbol[], pkgName: string, version: string, de
     lines.push(`## ${plural}\n`);
 
     for (const item of items) {
-      if (item.jsdoc) {
-        lines.push(`### ${item.name}`);
-        if (item.deprecation) lines.push(`> ⚠️ *Deprecated:* ${item.deprecation}`);
-        lines.push(`> ${item.jsdoc}`);
-        if (item.signature.length < 200) {
-          lines.push(`\`${item.signature.replace(/\n/g, " ").replace(/  +/g, " ").slice(0, 200)}\``);
-        }
-      } else {
-        lines.push(`- \`${item.name}\``);
+      // Show deprecation badge
+      if (item.deprecation) {
+        lines.push(`- ⚠️ **${item.name}** — *Deprecated:* ${item.deprecation.replace(/\s*@deprecated\s*/g, "").slice(0, 120)}`);
+        continue;
       }
-      lines.push("");
+
+      // Show JSDoc description
+      if (item.jsdoc) {
+        lines.push(`- **${item.name}**`);
+        lines.push(`  ${item.jsdoc.replace(/\n/g, " ").slice(0, 200)}`);
+        continue;
+      }
+
+      // Fallback: just the name
+      lines.push(`- \`${item.name}\``);
     }
+    lines.push("");
   }
 
   const shown = Object.values(groups).flat().length;
   if (shown < symbols.length) {
-    lines.push(`*Showing ${shown} of ${symbols.length} documented symbols. Use \`query\` to find a specific symbol.*`);
+    lines.push(`*Showing ${shown} of ${symbols.length} symbols. Use \`query\` to find a specific symbol.*`);
   }
 
   return lines.join("\n");
