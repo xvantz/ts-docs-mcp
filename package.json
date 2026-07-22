@@ -1,6 +1,6 @@
 {
   "name": "ts-docs-mcp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "MCP server that provides LLMs with accurate, up-to-date TypeScript API documentation directly from node_modules — no stale READMEs, no hallucinations.",
   "type": "module",
   "bin": {
