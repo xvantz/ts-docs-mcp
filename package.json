@@ -1,0 +1,42 @@
+{
+  "name": "ts-docs-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that provides LLMs with accurate, up-to-date TypeScript API documentation directly from node_modules — no stale READMEs, no hallucinations.",
+  "type": "module",
+  "bin": {
+    "ts-docs-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "typescript",
+    "documentation",
+    "typedoc",
+    "llm",
+    "ai",
+    "cursor",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.827482.xyz/xvantz/ts-docs-mcp.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "typedoc": "^0.28.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
