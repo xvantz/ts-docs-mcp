@@ -79,7 +79,23 @@ npm registry → GitHub .ts (JSDoc) → npm tarball (.d.ts) → DefinitelyTyped 
 
 | Tool | Description |
 |------|-------------|
-| `get_package_docs` | Get API docs for any npm package. Optional `query` to find a specific symbol. |
+| `get_package_docs` | Get API docs for any npm package. Optional `query`, `version`, `subpath`. |
+
+### Examples
+
+```markdown
+# Latest version
+get_package_docs("zod")
+
+# Specific version
+get_package_docs("zod", version="3.23.8")
+
+# Subpath export (e.g. zod/v4/classic)
+get_package_docs("zod", subpath="v4/classic")
+
+# Query a specific symbol
+get_package_docs("zod", query="transform")
+```
 
 ### Fallback chain
 

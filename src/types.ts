@@ -12,6 +12,7 @@ export interface PackageInfo {
   sourceHint: string | null;
   typesHint: string | null;
   tarballUrl: string | null;
+  exports?: Record<string, any>;
 }
 
 /** A parsed public API symbol with its JSDoc documentation. */

@@ -54,8 +54,8 @@ export async function mapConcurrent<T, R>(
 /*  Package info                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Find types entry from nested exports map. */
-function extractTypesHint(exports: any): string | null {
+/** Find types entry from nested exports map (exports, import, require, etc.). */
+export function extractTypesHint(exports: any): string | null {
   if (!exports || typeof exports !== "object") return null;
   if (typeof exports === "string") return exports;
   if (exports.types && typeof exports.types === "string") return exports.types;
@@ -68,13 +68,40 @@ function extractTypesHint(exports: any): string | null {
   return null;
 }
 
-/** Resolve package metadata and GitHub info from the npm registry. */
-export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
+/** Resolve subpath export entry (e.g. "./v4/classic") from package exports map. */
+export function resolveSubpath(exports: any, subpath: string): { typesHint: string | null; sourceHint: string | null } {
+  const key = subpath.startsWith(".") ? subpath : `./${subpath}`;
+  const entry = exports[key];
+  if (!entry) return { typesHint: null, sourceHint: null };
+
+  if (typeof entry === "string") {
+    return { typesHint: entry, sourceHint: entry };
+  }
+
+  // Conditional export — extract types + source from nested conditions
+  const typesHint = extractTypesHint(entry);
+  let sourceHint: string | null = null;
+  if (entry.source && typeof entry.source === "string") sourceHint = entry.source;
+  if (!sourceHint) {
+    // Try to derive source from import/default
+    const importPath = entry.import || entry.default || null;
+    if (typeof importPath === "string") sourceHint = importPath;
+  }
+  return { typesHint, sourceHint };
+}
+
+/**
+ * Resolve package metadata and GitHub info from the npm registry.
+ * When versionOverride is provided, fetches that specific version.
+ */
+export async function getPackageInfo(pkg: string, versionOverride?: string): Promise<PackageInfo> {
   const data = await fetchJSON(`${NPM_REGISTRY}/${encodeURIComponent(pkg)}`);
-  const version = data["dist-tags"]?.latest;
-  if (!version) throw new Error(`No latest version for "${pkg}"`);
+  const version = versionOverride || data["dist-tags"]?.latest;
+  if (!version) throw new Error(`No version found for "${pkg}"`);
 
   const v = data.versions?.[version];
+  if (!v) throw new Error(`Version "${version}" not found for "${pkg}"`);
+
   const description = v?.description ?? data.description ?? "";
 
   // Parse GitHub repo
@@ -87,7 +114,7 @@ export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
   const owner = match[1];
   const repoName = match[2];
 
-  // Find source entry point
+  // Find source entry point for root (".")
   let sourceHint: string | null = null;
   const exp = v?.exports?.["."];
   if (exp) {
@@ -105,5 +132,5 @@ export async function getPackageInfo(pkg: string): Promise<PackageInfo> {
     v?.types ?? v?.typings ?? extractTypesHint(v?.exports?.["."]) ?? null;
   const tarballUrl: string | null = v?.dist?.tarball ?? null;
 
-  return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint, typesHint, tarballUrl };
+  return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint, typesHint, tarballUrl, exports: v?.exports };
 }

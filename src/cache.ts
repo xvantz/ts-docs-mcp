@@ -17,8 +17,10 @@ function cacheDir(): string {
 
 export const CACHE_DIR = cacheDir();
 
-function cacheKey(pkg: string, version: string): string {
-  return `${pkg}@${version}`.replace(/\//g, "_");
+function cacheKey(pkg: string, version: string, subpath?: string): string {
+  const base = `${pkg}@${version}`;
+  const key = subpath ? `${base}/${subpath}` : base;
+  return key.replace(/\//g, "_");
 }
 
 function cachePath(key: string): string {
@@ -26,8 +28,8 @@ function cachePath(key: string): string {
 }
 
 /** Read cached data for a package version. Returns null if missing or expired. */
-export function readCache(pkg: string, version: string): string | null {
-  const p = cachePath(cacheKey(pkg, version));
+export function readCache(pkg: string, version: string, subpath?: string): string | null {
+  const p = cachePath(cacheKey(pkg, version, subpath));
   if (!existsSync(p)) return null;
 
   try {
@@ -45,11 +47,11 @@ export function readCache(pkg: string, version: string): string | null {
 }
 
 /** Write package documentation to cache. Cleans old entries periodically. */
-export function writeCache(pkg: string, version: string, data: string): void {
+export function writeCache(pkg: string, version: string, data: string, subpath?: string): void {
   if (!existsSync(CACHE_DIR)) {
     mkdirSync(CACHE_DIR, { recursive: true });
   }
-  writeFileSync(cachePath(cacheKey(pkg, version)), data, "utf-8");
+  writeFileSync(cachePath(cacheKey(pkg, version, subpath)), data, "utf-8");
 
   // Probabilistic cleanup: ~5% chance per write to avoid perf hit
   if (Math.random() < 0.05) {
