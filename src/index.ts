@@ -114,9 +114,14 @@ async function fetchSourceFile(
   }
   paths.push(
     "src/index.ts", "lib/index.ts",
-    "lib/index.js", "lib/express.js", "lib/main.js",
+    "lib/index.js", "lib/main.js",
     "src/index.js", "src/main.js",
-    "index.ts", "index.js", "express.js",
+    "index.ts", "index.js",
+    // Try package name as filename: fastify.js, express.js
+    `${pkgDir}.ts`, `${pkgDir}.js`,
+    `${repo}.ts`, `${repo}.js`,
+    `lib/${pkgDir}.js`, `lib/${pkgDir}.ts`,
+    `src/${pkgDir}.ts`, `src/${pkgDir}.js`,
     `packages/${repo}/src/index.ts`,
     `packages/${pkgDir}/src/index.ts`,
     `packages/${repo}/lib/index.ts`,
