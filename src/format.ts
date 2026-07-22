@@ -4,6 +4,25 @@
 
 import type { PublicSymbol } from "./types.js";
 
+/** Merge two symbol arrays, deduplicating by name. Prefers GitHub (first) over tarball (second). */
+export function mergeSymbols(github: PublicSymbol[], tarball: PublicSymbol[]): PublicSymbol[] {
+  const names = new Set<string>();
+  const merged: PublicSymbol[] = [];
+  for (const s of github) {
+    if (!names.has(s.name)) {
+      names.add(s.name);
+      merged.push(s);
+    }
+  }
+  for (const s of tarball) {
+    if (!names.has(s.name)) {
+      names.add(s.name);
+      merged.push(s);
+    }
+  }
+  return merged;
+}
+
 /** Clean a raw signature for display: remove leading 'export ', collapse whitespace, truncate. */
 function cleanSignature(sig: string, maxLen = 120): string {
   return sig

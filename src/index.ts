@@ -22,7 +22,7 @@ import {
 import type { PublicSymbol } from "./types.js";
 import { getPackageInfo, fetchSourceFile, fetchSourceContent, resolveSource, fetchDtsFromTarball } from "./registry.js";
 import { parsePublicAPI } from "./parser.js";
-import { toSummary, formatSymbolDetail } from "./format.js";
+import { toSummary, formatSymbolDetail, mergeSymbols } from "./format.js";
 import { readCache, writeCache } from "./cache.js";
 
 /* ------------------------------------------------------------------ */
@@ -120,25 +120,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const symbols = parsePublicAPI(allSource);
 
-        // 6. Fallback chain: GitHub .d.ts → npm tarball .d.ts
-        if (symbols.length === 0) {
-          let dtsContent: string | null = null;
-
-          // Try GitHub .d.ts first
-          if (info.typesHint) {
-            const dtsFile = await fetchSourceFile(info.owner, info.repo, info.version, info.typesHint, info.name);
-            if (dtsFile) dtsContent = dtsFile.content;
-          }
-
-          // Try npm tarball if GitHub .d.ts failed or express (no typesHint)
-          if (!dtsContent && info.tarballUrl) {
-            dtsContent = await fetchDtsFromTarball(info.tarballUrl, info.typesHint);
-          }
-
+        // 6. Always try tarball fallback & merge (GitHub source often partial — barrel files)
+        if (info.tarballUrl) {
+          const dtsContent = await fetchDtsFromTarball(info.tarballUrl, info.typesHint);
           if (dtsContent) {
             const dtsSymbols = parsePublicAPI(dtsContent);
             if (dtsSymbols.length > 0) {
-              const merged = [...symbols, ...dtsSymbols];
+              const merged = mergeSymbols(symbols, dtsSymbols);
               writeCache(info.name, info.version, JSON.stringify({ symbols: merged, fetchedAt: Date.now() }));
               if (query) {
                 const found = merged.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
@@ -149,7 +137,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // 7. Cache
+        // 7. Cache & respond
         writeCache(info.name, info.version, JSON.stringify({ symbols, fetchedAt: Date.now() }));
 
         // 8. Respond
