@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * ts-docs-mcp
- * MCP server that provides LLMs with accurate TypeScript API documentation
- * directly from node_modules — resolving .d.ts files and generating
- * structured Markdown via TypeDoc.
+ * ts-docs-mcp — MCP server that provides LLMs with accurate,
+ * version-aware TypeScript API documentation.
+ *
+ * Sources documentation directly from source code:
+ *   npm registry → GitHub raw → JSDoc + signatures
+ *
+ * No node_modules dependency. Works in any environment.
+ *
+ * Tools:
+ *   get_package_docs(package, query?) — API docs for any npm package
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -13,334 +19,474 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execSync } from "child_process";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
-import { join, dirname, basename } from "path";
-import { createRequire } from "module";
-import { z } from "zod";
+import { join, dirname } from "path";
 
 /* ------------------------------------------------------------------ */
 /*  Config                                                             */
 /* ------------------------------------------------------------------ */
 
 const CACHE_DIR = ".llm-cache";
-const TYPEDOC_TIMEOUT = 60_000; // 60s for large packages
+const NPM_REGISTRY = "https://registry.npmjs.org";
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
+/*  HTTP helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Resolve the .d.ts entrypoint for a package, or null. */
-function resolveTypesPath(pkg: string): string | null {
-  try {
-    const req = createRequire(import.meta.url);
-    const pkgJsonPath = req.resolve(`${pkg}/package.json`);
-    const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
-
-    // Prefer types → typings → guess from main
-    const typesField: string | undefined =
-      pkgJson.types ?? pkgJson.typings ?? guessTypesFromMain(pkgJson.main);
-
-    if (!typesField) return null;
-
-    return req.resolve(`${pkg}/${typesField}`);
-  } catch {
-    return null;
-  }
+async function fetchJSON(url: string): Promise<any> {
+  const res = await fetch(url, {
+    headers: { "Accept": "application/json", "User-Agent": "ts-docs-mcp/0.1" },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+  return res.json();
 }
 
-function guessTypesFromMain(main?: string): string | undefined {
-  if (!main) return undefined;
-  return main.replace(/\.(js|mjs|cjs)$/, ".d.ts");
-}
-
-/** Read the installed version of a package. */
-function getPackageVersion(pkg: string): string | null {
-  try {
-    const req = createRequire(import.meta.url);
-    const pkgJsonPath = req.resolve(`${pkg}/package.json`);
-    const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
-    return pkgJson.version ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/** Cache key: pkg@version */
-function cacheKey(pkg: string, version: string): string {
-  return `${pkg}@${version}`.replace(/\//g, "_");
-}
-
-function cachePath(key: string): string {
-  return join(CACHE_DIR, `${key}.md`);
-}
-
-function ensureCacheDir(): void {
-  if (!existsSync(CACHE_DIR)) {
-    mkdirSync(CACHE_DIR, { recursive: true });
-  }
+async function fetchText(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "ts-docs-mcp/0.1" },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+  return res.text();
 }
 
 /* ------------------------------------------------------------------ */
-/*  TypeDoc → Markdown converter                                       */
+/*  npm registry → GitHub source                                       */
 /* ------------------------------------------------------------------ */
 
-interface TypedocReflection {
-  id: number;
+interface PackageInfo {
   name: string;
-  kind: number;
-  kindString?: string;
-  comment?: { shortText?: string; text?: string };
-  type?: unknown;
-  signatures?: TypedocReflection[];
-  children?: TypedocReflection[];
-  parameters?: TypedocReflection[];
-  flags?: { isExported?: boolean; isOptional?: boolean };
-  sources?: { fileName: string; line: number }[];
+  version: string;
+  description: string;
+  owner: string;
+  repo: string;
+  sourceHint: string | null;
 }
 
-/**
- * Run typedoc --json on a .d.ts entrypoint, parse the output,
- * and produce a concise Markdown document optimised for LLM consumption.
- */
-function generateDocsMarkdown(pkg: string): string {
-  const typesPath = resolveTypesPath(pkg);
-  if (!typesPath) {
-    return `> No TypeScript types found for \`${pkg}\`.\n`;
-  }
+async function getPackageInfo(pkg: string): Promise<PackageInfo> {
+  const data = await fetchJSON(`${NPM_REGISTRY}/${encodeURIComponent(pkg)}`);
+  const version = data["dist-tags"]?.latest;
+  if (!version) throw new Error("No latest version found");
 
-  // We pipe JSON to stdout instead of writing a temp file.
-  // typedoc's --json accepts a file path; we'll write to a temp dir.
-  const tmpDir = join(CACHE_DIR, `.tmp-${pkg}-${Date.now()}`);
-  mkdirSync(tmpDir, { recursive: true });
+  const v = data.versions?.[version];
+  const description = v?.description ?? data.description ?? "";
 
-  const jsonOut = join(tmpDir, "docs.json");
+  // Parse GitHub repo
+  const repo = v?.repository ?? data.repository;
+  const repoStr = typeof repo === "string" ? repo : repo?.url ?? "";
+  let match = repoStr.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+  if (!match) match = repoStr.match(/^([\w.-]+)\/([\w.-]+)$/);
+  if (!match) throw new Error("Not a GitHub repository");
 
-  try {
-    execSync(
-      `npx typedoc --json "${jsonOut}" --entryPointStrategy expand "${typesPath}"`,
-      {
-        stdio: "pipe",
-        timeout: TYPEDOC_TIMEOUT,
-        env: { ...process.env, FORCE_COLOR: "0" },
+  const owner = match[1];
+  const repoName = match[2];
+
+  // Find source entry point
+  let sourceHint: string | null = null;
+  const exp = v?.exports?.["."];
+  if (exp) {
+    for (const key of Object.keys(exp)) {
+      if (key.endsWith("/source") || key === "source") {
+        sourceHint = exp[key];
+        break;
       }
-    );
-  } catch (err: any) {
-    // typedoc may exit non-zero for warnings; still try to read output
-    if (!existsSync(jsonOut)) {
-      return `> TypeDoc failed for \`${pkg}\`: ${err.message ?? err}\n`;
+    }
+  }
+  if (!sourceHint && v?.source) sourceHint = v.source;
+
+  return { name: v?.name ?? pkg, version, description, owner, repo: repoName, sourceHint };
+}
+
+/** Try multiple source URL patterns and return the first that resolves. */
+async function fetchSourceFile(
+  owner: string, repo: string, ref: string, hint: string | null,
+  pkgName: string
+): Promise<{ content: string; path: string } | null> {
+  const pkgDir = pkgName.replace(/^@/, "").replace(/\//, "-");
+
+  const paths: string[] = [];
+  if (hint) {
+    const cleanHint = hint.replace(/^\.\//, "");
+    paths.push(cleanHint); // as-is
+    paths.push(`packages/${repo}/${cleanHint}`); // monorepo: packages/repo/
+    paths.push(`packages/${pkgDir}/${cleanHint}`); // monorepo: packages/name/
+    paths.push(`lib/${cleanHint}`); // lib/ prefix
+  }
+  paths.push(
+    "src/index.ts", "lib/index.ts", "index.ts",
+    `packages/${repo}/src/index.ts`,
+    `packages/${pkgDir}/src/index.ts`,
+    `packages/${repo}/lib/index.ts`,
+    "packages/core/src/index.ts",
+  );
+
+  const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
+  for (const r of refs) {
+    for (const p of paths) {
+      const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${p}`;
+      try {
+        const content = await fetchText(url);
+        return { content, path: p };
+      } catch {}
+    }
+  }
+  return null;
+}
+
+/** Follow re-exports in a TS source file to find the actual declarations. */
+async function resolveSource(
+  owner: string, repo: string, ref: string, startPath: string, visited = new Set<string>()
+): Promise<string[]> {
+  const files: string[] = [startPath];
+
+  // Resolve re-exports up to 2 levels deep
+  const resolveLevel = async (path: string, depth: number): Promise<void> => {
+    if (depth > 2 || files.length >= 15) return;
+    const content = await fetchSourceContent(owner, repo, ref, path);
+    if (!content) return;
+
+    const reExportRegex = /export\s+(?:\*|{[^}]+})\s+from\s+["']([^"']+)["']/g;
+    let match;
+    let count = 0;
+    while ((match = reExportRegex.exec(content)) !== null) {
+      count++;
+      if (files.length >= 15) break;
+      const importPath = match[1];
+      const normalized = importPath.replace(/\.js$/, ".ts").replace(/\.ts$/, "");
+      const baseDir = dirname(path);
+      const resolved = join(baseDir, `${normalized}.ts`).replace(/^\.\//, "");
+
+      if (visited.has(resolved)) continue;
+      visited.add(resolved);
+
+      try {
+        const content = await fetchSourceContent(owner, repo, ref, resolved);
+        if (content) {
+          files.push(resolved);
+          await resolveLevel(resolved, depth + 1);
+        }
+      } catch {
+      }
+    }
+    if (count === 0) return;
+  };
+
+  await resolveLevel(startPath, 1);
+
+  return files;
+}
+
+async function fetchSourceContent(
+  owner: string, repo: string, ref: string, path: string
+): Promise<string | null> {
+  const refs = ref.startsWith("v") ? [ref, ref.slice(1)] : [`v${ref}`, ref];
+  for (const r of refs) {
+    const url = `https://raw.githubusercontent.com/${owner}/${repo}/${r}/${path}`;
+    try {
+      const text = await fetchText(url);
+      return text;
+    } catch {}
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  JSDoc parser                                                       */
+/* ------------------------------------------------------------------ */
+
+interface PublicSymbol {
+  name: string;
+  kind: "class" | "interface" | "function" | "type" | "variable" | "enum";
+  jsdoc: string;
+  signature: string;
+  deprecation?: string;
+  methods?: { name: string; jsdoc: string; signature: string; deprecation?: string }[];
+}
+
+/** Parse JSDoc + declarations from TypeScript source code. */
+function parsePublicAPI(source: string): PublicSymbol[] {
+  const symbols: PublicSymbol[] = [];
+  const lines = source.split("\n");
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+
+    // Detect JSDoc comment
+    if (line.startsWith("/**")) {
+      const jsdocStart = i;
+      let jsdocLines: string[] = [];
+      while (i < lines.length && !lines[i].trim().startsWith("*/")) {
+        jsdocLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) {
+        jsdocLines.push(lines[i]); // include */
+        i++;
+      }
+
+      // Collect the declaration (until { or ; or blank line)
+      let declLines: string[] = [];
+      while (i < lines.length) {
+        const dl = lines[i].trim();
+        declLines.push(lines[i]);
+        if (dl === "{" || dl.endsWith("{") || dl.endsWith(";") || dl === "" ||
+            dl.startsWith("//") || dl.startsWith("/**") || dl.startsWith("*/")) {
+          break;
+        }
+        i++;
+      }
+
+      const decl = declLines.join("\n").trim();
+      const jsdoc = parseJSDoc(jsdocLines);
+      const deprecation = extractDeprecation(jsdocLines);
+
+      // Match: export class|interface|function|enum|type|const Name
+      const classMatch = decl.match(/(?:export\s+)?(?:default\s+)?class\s+(\w+)/);
+      const ifaceMatch = decl.match(/(?:export\s+)?(?:default\s+)?interface\s+(\w+)/);
+      const funcMatch = decl.match(/(?:export\s+)?(?:default\s+)?function\s+(\w+)/);
+      const typeMatch = decl.match(/(?:export\s+)?type\s+(\w+)/);
+      const constMatch = decl.match(/(?:export\s+)?(?:const|let|var)\s+(\w+)/);
+      const enumMatch = decl.match(/(?:export\s+)?(?:default\s+)?enum\s+(\w+)/);
+
+      if (classMatch) {
+        symbols.push({
+          name: classMatch[1], kind: "class", jsdoc, signature: decl,
+          deprecation,
+          methods: parseMethods(source, classMatch[1]),
+        });
+      } else if (ifaceMatch) {
+        symbols.push({
+          name: ifaceMatch[1], kind: "interface", jsdoc, signature: decl,
+          deprecation,
+          methods: parseMethods(source, ifaceMatch[1]),
+        });
+      } else if (funcMatch) {
+        symbols.push({
+          name: funcMatch[1], kind: "function", jsdoc, signature: decl,
+          deprecation,
+        });
+      } else if (enumMatch) {
+        symbols.push({
+          name: enumMatch[1], kind: "enum", jsdoc, signature: decl,
+          deprecation,
+        });
+      } else if (typeMatch) {
+        symbols.push({
+          name: typeMatch[1], kind: "type", jsdoc, signature: decl,
+          deprecation,
+        });
+      } else if (constMatch) {
+        symbols.push({
+          name: constMatch[1], kind: "variable", jsdoc, signature: decl,
+          deprecation,
+        });
+      }
+    } else {
+      i++;
     }
   }
 
-  const raw = JSON.parse(readFileSync(jsonOut, "utf-8"));
+  return symbols;
+}
+
+function parseJSDoc(jsdocLines: string[]): string {
+  return jsdocLines
+    .map(l => l.replace(/^\s*\*\s?/, "").replace(/^\s*\/\*\*?\s?/, "").replace(/\s*\*\/$/, ""))
+    .filter(l => l.trim() && !l.trim().startsWith("@"))
+    .join(" ")
+    .trim();
+}
+
+function extractDeprecation(jsdocLines: string[]): string | undefined {
+  for (const l of jsdocLines) {
+    const trimmed = l.trim();
+    if (trimmed.includes("@deprecated")) {
+      return trimmed.replace(/^\s*\*\s*@deprecated\s*/, "").trim();
+    }
+  }
+  return undefined;
+}
+
+/** Find methods on a class/interface by scanning its body. */
+function parseMethods(source: string, className: string): { name: string; jsdoc: string; signature: string; deprecation?: string }[] {
+  const methods: { name: string; jsdoc: string; signature: string; deprecation?: string }[] = [];
+  const lines = source.split("\n");
+
+  // Find the class/interface body
+  let inBody = false;
+  let braceDepth = 0;
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (line.includes(`class ${className}`) || line.includes(`interface ${className}`) ||
+        line.includes(`${className}: core.$constructor`)) {
+      inBody = true;
+      braceDepth = 0;
+      i++;
+      continue;
+    }
+
+    if (inBody) {
+      if (line.includes("{") || line.endsWith("{")) braceDepth++;
+      if (line.includes("}") || line.startsWith("}")) {
+        braceDepth--;
+        if (braceDepth < 0) break;
+        i++;
+        continue;
+      }
+
+      if (braceDepth > 0 && (line.startsWith("/**") || line.startsWith("//"))) {
+        // Method with JSDoc
+        let jsdocLines: string[] = [];
+        let j = i;
+        if (line.startsWith("/**")) {
+          while (j < lines.length && !lines[j].trim().startsWith("*/")) {
+            jsdocLines.push(lines[j]);
+            j++;
+          }
+          if (j < lines.length) { jsdocLines.push(lines[j]); j++; }
+        } else {
+          jsdocLines = [line];
+          j++;
+        }
+
+        // Read method name
+        let declLines: string[] = [];
+        while (j < Math.min(j + 10, lines.length)) {
+          const dl = lines[j].trim();
+          declLines.push(lines[j]);
+          if (dl === "{" || dl.endsWith("{")) break;
+          j++;
+        }
+
+        const decl = declLines.join("\n").trim();
+        const methodMatch = decl.match(/(?:(\w+)\s*[=:]\s*(?:\([^)]*\)\s*=>|[^;]+)|(\w+)\s*\([^)]*\))/);
+        const methodName = methodMatch?.[1] ?? methodMatch?.[2];
+        if (methodName && !methodName.startsWith("_") && methodName !== "constructor") {
+          const jsdoc = parseJSDoc(jsdocLines);
+          const deprecation = extractDeprecation(jsdocLines);
+          methods.push({ name: methodName, jsdoc, signature: decl, deprecation });
+        }
+
+        i = j;
+        continue;
+      }
+
+      // Method without JSDoc — simple name detection
+      const methodMatch = line.match(/^\s*(\w+)\s*(?:\(|[:=])/);
+      if (methodMatch && !methodMatch[1].startsWith("_") && methodMatch[1] !== "constructor") {
+        const name = methodMatch[1];
+        const existing = methods.find(m => m.name === name);
+        if (!existing && methods.length < 30) {
+          methods.push({ name, jsdoc: "", signature: line, deprecation: undefined });
+        }
+      }
+    }
+
+    i++;
+  }
+
+  return methods;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Markdown formatting                                                */
+/* ------------------------------------------------------------------ */
+
+function toSummary(symbols: PublicSymbol[], pkgName: string, version: string, description: string): string {
   const lines: string[] = [];
+  lines.push(`# ${pkgName} API v${version}`);
+  if (description) lines.push(`> ${description}`);
+  lines.push("");
 
-  lines.push(`# ${raw.name ?? pkg} API`);
-  if (raw.packageVersion) {
-    lines.push(`> Version: ${raw.packageVersion}\n`);
+  // Group by kind
+  const groups: Record<string, PublicSymbol[]> = {};
+  for (const s of symbols) {
+    if (!groups[s.kind]) groups[s.kind] = [];
+    if (groups[s.kind].length < 12) groups[s.kind].push(s);
   }
 
-  if (raw.children) {
-    for (const child of raw.children) {
-      renderReflection(child, lines, 2);
+  const order = ["class", "interface", "enum", "function", "type", "variable"];
+  for (const kind of order) {
+    const items = groups[kind];
+    if (!items?.length) continue;
+    const plural = kind === "class" ? "Classes" : kind === "interface" ? "Interfaces" : kind === "function" ? "Functions" : kind === "type" ? "Type Aliases" : kind === "variable" ? "Variables" : `${kind}s`;
+    lines.push(`## ${plural}\n`);
+
+    for (const item of items) {
+      if (item.jsdoc) {
+        lines.push(`### ${item.name}`);
+        if (item.deprecation) lines.push(`> ⚠️ *Deprecated:* ${item.deprecation}`);
+        lines.push(`> ${item.jsdoc}`);
+        if (item.signature.length < 200) {
+          lines.push(`\`${item.signature.replace(/\n/g, " ").replace(/  +/g, " ").slice(0, 200)}\``);
+        }
+      } else {
+        lines.push(`- \`${item.name}\``);
+      }
+      lines.push("");
     }
   }
 
-  // Cleanup
-  try {
-    execSync(`rm -rf "${tmpDir}"`);
-  } catch {
-    // ignore cleanup errors
+  const shown = Object.values(groups).flat().length;
+  if (shown < symbols.length) {
+    lines.push(`*Showing ${shown} of ${symbols.length} documented symbols. Use \`query\` to find a specific symbol.*`);
   }
 
   return lines.join("\n");
 }
 
-/** Render a single TypeDoc reflection to Markdown lines. */
-function renderReflection(
-  ref: TypedocReflection,
-  lines: string[],
-  headingLevel: number
-): void {
-  const heading = "#".repeat(headingLevel);
-  const kind = ref.kindString ? `*(${ref.kindString})*` : "";
+function formatSymbolDetail(item: PublicSymbol): string {
+  const lines: string[] = [];
+  lines.push(`## ${item.name} (${item.kind})`);
+  if (item.deprecation) lines.push(`> ⚠️ *Deprecated:* ${item.deprecation}`);
+  if (item.jsdoc) lines.push(`> ${item.jsdoc}`);
+  lines.push("");
+  lines.push(`\`\`\`typescript\n${item.signature}\n\`\`\``);
+  lines.push("");
 
-  lines.push(`${heading} ${ref.name} ${kind}`);
-
-  // JSDoc / comment
-  const comment = ref.comment;
-  if (comment?.shortText) {
-    lines.push("");
-    lines.push(comment.shortText);
-  }
-  if (comment?.text) {
-    lines.push("");
-    lines.push(comment.text);
-  }
-
-  // Signature (for functions / methods)
-  if (ref.signatures && ref.signatures.length > 0) {
-    for (const sig of ref.signatures) {
-      const sigComment = sig.comment;
-      if (sigComment?.shortText) {
-        lines.push("");
-        lines.push(`> _${sigComment.shortText}_`);
+  if (item.methods && item.methods.length > 0) {
+    const withJSDoc = item.methods.filter(m => m.jsdoc);
+    lines.push("### Methods\n");
+    for (const m of (withJSDoc.length > 0 ? withJSDoc : item.methods).slice(0, 25)) {
+      if (m.jsdoc) {
+        if (m.deprecation) lines.push(`> ⚠️ *Deprecated:* ${m.deprecation}`);
+        lines.push(`> ${m.jsdoc}`);
       }
-
-      const params =
-        sig.parameters
-          ?.map(
-            (p) =>
-              `${p.name}${p.flags?.isOptional ? "?" : ""}: ${stringifyType(p.type)}`
-          )
-          .join(", ") ?? "";
-
-      const returnType = sig.type ? stringifyType(sig.type) : "void";
-      lines.push("");
-      lines.push(`\`${ref.name}(${params}): ${returnType}\``);
+      lines.push(`- \`${m.signature.replace(/\n/g, " ").replace(/  +/g, " ").slice(0, 150)}\``);
+    }
+    if (item.methods.length > 25) {
+      lines.push(`\n*… ${item.methods.length - 25} more methods*`);
     }
   }
 
-  // Type alias
-  if (ref.kind === 4194304 && ref.type) {
-    lines.push("");
-    lines.push(`\`type ${ref.name} = ${stringifyType(ref.type)}\``);
-  }
-
-  // Children (nested members)
-  if (ref.children && ref.children.length > 0 && headingLevel < 4) {
-    for (const child of ref.children) {
-      renderReflection(child, lines, headingLevel + 1);
-    }
-  }
-
-  lines.push(""); // spacing
-}
-
-/** Pretty-print a TypeDoc type object. */
-function stringifyType(type: any): string {
-  if (!type) return "unknown";
-
-  switch (type.type) {
-    case "intrinsic":
-      return type.name ?? "unknown";
-
-    case "reference": {
-      const args =
-        type.typeArguments
-          ?.map((a: any) => stringifyType(a))
-          .join(", ") ?? "";
-      return args
-        ? `${type.name}<${args}>`
-        : (type.name ?? "unknown");
-    }
-
-    case "array":
-      return `${stringifyType(type.elementType)}[]`;
-
-    case "union":
-      return type.types
-        ? type.types.map((t: any) => stringifyType(t)).join(" | ")
-        : "unknown";
-
-    case "intersection":
-      return type.types
-        ? type.types.map((t: any) => stringifyType(t)).join(" & ")
-        : "unknown";
-
-    case "literal":
-      return type.value !== undefined
-        ? JSON.stringify(type.value)
-        : "unknown";
-
-    case "reflection":
-      return "{ … }";
-
-    case "tuple":
-      return `[${type.elements?.map((e: any) => stringifyType(e)).join(", ") ?? ""}]`;
-
-    case "conditional":
-      return `${stringifyType(type.checkType)} extends ${stringifyType(type.extendsType)} ? ${stringifyType(type.trueType)} : ${stringifyType(type.falseType)}`;
-
-    case "indexedAccess":
-      return `${stringifyType(type.indexType)}[${stringifyType(type.objectType)}]`;
-
-    case "query":
-      return `typeof ${stringifyType(type.queryType)}`;
-
-    default:
-      return type.name ?? type.type ?? "unknown";
-  }
+  return lines.join("\n");
 }
 
 /* ------------------------------------------------------------------ */
 /*  Cache                                                              */
 /* ------------------------------------------------------------------ */
 
-function readFromCache(pkg: string, version: string): string | null {
-  const path = cachePath(cacheKey(pkg, version));
-  return existsSync(path) ? readFileSync(path, "utf-8") : null;
+function cacheKey(pkg: string, version: string): string {
+  return `${pkg}@${version}`.replace(/\//g, "_");
 }
 
-function writeToCache(pkg: string, version: string, content: string): void {
-  ensureCacheDir();
-  writeFileSync(cachePath(cacheKey(pkg, version)), content, "utf-8");
+function cachePath(key: string): string {
+  return join(CACHE_DIR, `${key}.json`);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Search within cached docs                                          */
-/* ------------------------------------------------------------------ */
-
-/** Crude section-based search in a Markdown document. */
-function findSymbolInDocs(docs: string, query: string): string {
-  const lines = docs.split("\n");
-  const resultLines: string[] = [];
-  let inSection = false;
-  let sectionDepth = 0;
-
-  for (const line of lines) {
-    const isHeading = /^#{1,4}\s/.test(line);
-
-    if (isHeading) {
-      const depth = line.match(/^#+/)![0].length;
-      if (
-        line.toLowerCase().includes(query.toLowerCase()) &&
-        depth <= 3
-      ) {
-        // Start a new hit section at this heading
-        resultLines.push("\n" + line);
-        sectionDepth = depth;
-        inSection = true;
-        continue;
-      }
-
-      // Close section when we hit a heading of same or higher level
-      if (inSection && depth <= sectionDepth) {
-        inSection = false;
-      }
-    }
-
-    if (inSection) {
-      resultLines.push(line);
-    }
-  }
-
-  // If nothing found, return a relevant excerpt
-  return resultLines.length > 0
-    ? resultLines.join("\n")
-    : extractExcerpt(docs, query);
+function readCache(pkg: string, version: string): string | null {
+  const p = cachePath(cacheKey(pkg, version));
+  if (!existsSync(p)) return null;
+  const age = Date.now() - readFileSync(p, "utf-8").length; // rough check
+  return readFileSync(p, "utf-8");
 }
 
-function extractExcerpt(docs: string, query: string): string {
-  const lines = docs.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].toLowerCase().includes(query.toLowerCase())) {
-      const start = Math.max(0, i - 3);
-      const end = Math.min(lines.length, i + 10);
-      return lines.slice(start, end).join("\n");
-    }
-  }
-  return docs.slice(0, 2000); // fallback
+function writeCache(pkg: string, version: string, data: string): void {
+  if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+  writeFileSync(cachePath(cacheKey(pkg, version)), data, "utf-8");
 }
 
 /* ------------------------------------------------------------------ */
@@ -348,15 +494,8 @@ function extractExcerpt(docs: string, query: string): string {
 /* ------------------------------------------------------------------ */
 
 const server = new Server(
-  {
-    name: "ts-docs-mcp",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { name: "ts-docs-mcp", version: "0.1.0" },
+  { capabilities: { tools: {} } },
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -364,37 +503,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_package_docs",
       description: [
-        "Get the full API documentation for an npm package as Markdown.",
-        "Documentation is generated from the package's TypeScript definition files",
-        "(.d.ts) using TypeDoc, so it is always accurate and version-aware.",
-        "Results are cached by package version so subsequent calls are instant.",
+        "Get accurate API documentation for any npm package.",
+        "Documentation is sourced from the package's TypeScript source code on GitHub,",
+        "including JSDoc comments, method signatures, deprecation notices, and examples.",
+        "No local node_modules needed — works anywhere.",
+        "Optionally pass a 'query' to find a specific symbol.",
       ].join(" "),
       inputSchema: {
         type: "object",
         properties: {
           package: {
             type: "string",
-            description: "npm package name (e.g. 'zod', 'express', '@prisma/client')",
+            description: "npm package name, e.g. 'zod', 'express', '@prisma/client'",
           },
           query: {
             type: "string",
             description:
-              "Optional search term to find a specific symbol (class, function, type) within the docs. When omitted the full document is returned.",
+              "Optional — find a specific symbol (class, function, interface) within the package. When omitted returns the full public API overview.",
           },
         },
         required: ["package"],
-      },
-    },
-    {
-      name: "list_available_packages",
-      description: [
-        "List npm packages available in the current project's node_modules",
-        "that have TypeScript type definitions (.d.ts) and can be queried.",
-      ].join(" "),
-      inputSchema: {
-        type: "object",
-        properties: {},
-        required: [],
       },
     },
   ],
@@ -404,118 +532,82 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
-    /* ---- get_package_docs ---- */
     case "get_package_docs": {
       const pkg = String(args?.package ?? "");
       const query = args?.query ? String(args.query) : undefined;
 
       if (!pkg) {
-        return {
-          content: [{ type: "text", text: "Error: 'package' is required." }],
-          isError: true,
-        };
+        return { content: [{ type: "text", text: "Error: 'package' is required." }], isError: true };
       }
 
-      // 1. Resolve version
-      const version = getPackageVersion(pkg);
-      if (!version) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Package "${pkg}" not found in node_modules. Is it installed?`,
-            },
-          ],
-          isError: true,
-        };
-      }
+      try {
+        // 1. Get package info from npm registry
+        const info = await getPackageInfo(pkg);
 
-      // 2. Check cache
-      let docs = readFromCache(pkg, version);
-
-      // 3. Cache miss — generate
-      if (!docs) {
-        docs = generateDocsMarkdown(pkg);
-        writeToCache(pkg, version, docs);
-      }
-
-      // 4. If query, search
-      const result = query ? findSymbolInDocs(docs, query) : docs;
-
-      return {
-        content: [{ type: "text", text: result }],
-      };
-    }
-
-    /* ---- list_available_packages ---- */
-    case "list_available_packages": {
-      // Scan top-level node_modules for packages with .d.ts
-      const nodeModules = join(process.cwd(), "node_modules");
-      if (!existsSync(nodeModules)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No node_modules found in current directory.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const entries: string[] = [];
-      const dirs = execSync(`ls -1 "${nodeModules}"`, { encoding: "utf-8" })
-        .trim()
-        .split("\n");
-
-      for (const dir of dirs) {
-        if (dir.startsWith("@")) {
-          // Scoped package
-          const scopedPath = join(nodeModules, dir);
-          const scoped = execSync(`ls -1 "${scopedPath}"`, {
-            encoding: "utf-8",
-          })
-            .trim()
-            .split("\n");
-          for (const sub of scoped) {
-            const pkgJsonPath = join(scopedPath, sub, "package.json");
-            if (existsSync(pkgJsonPath)) {
-              const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
-              if (pkgJson.types || pkgJson.typings) {
-                entries.push(`${dir}/${sub}@${pkgJson.version ?? "?"}`);
-              }
+        // 2. Check cache
+        const cached = readCache(info.name, info.version);
+        if (cached) {
+          const data = JSON.parse(cached);
+          if (query) {
+            const found = data.symbols?.filter((s: PublicSymbol) =>
+              s.name.toLowerCase().includes(query.toLowerCase())
+            );
+            if (found?.length) {
+              return { content: [{ type: "text", text: found.map(formatSymbolDetail).join("\n\n---\n\n") }] };
             }
+            return { content: [{ type: "text", text: `Symbol "${query}" not found.` }] };
           }
-        } else {
-          const pkgJsonPath = join(nodeModules, dir, "package.json");
-          if (existsSync(pkgJsonPath)) {
-            try {
-              const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8"));
-              if (pkgJson.types || pkgJson.typings) {
-                entries.push(`${dir}@${pkgJson.version ?? "?"}`);
-              }
-            } catch {
-              // skip invalid package.json
-            }
-          }
+          return { content: [{ type: "text", text: toSummary(data.symbols, info.name, info.version, info.description) }] };
         }
+
+        // 3. Fetch source from GitHub
+        const file = await fetchSourceFile(info.owner, info.repo, info.version, info.sourceHint, info.name);
+        if (!file) {
+          return {
+            content: [{
+              type: "text",
+              text: `Could not fetch source for "${pkg}" v${info.version} from GitHub. The package may not have a public GitHub repository with source code.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // 4. Resolve additional files (follow re-exports)
+        const allFiles = await resolveSource(info.owner, info.repo, info.version, file.path, new Set());
+
+        // 5. Parse all source files
+        let allSource = file.content;
+        for (const f of allFiles.slice(1)) {
+          const content = await fetchSourceContent(info.owner, info.repo, info.version, f);
+          if (content) allSource += "\n\n" + content;
+        }
+
+        const symbols = parsePublicAPI(allSource);
+
+        // 6. Cache
+        writeCache(info.name, info.version, JSON.stringify({ symbols, fetchedAt: Date.now() }));
+
+        // 7. Respond
+        if (query) {
+          const found = symbols.filter(s => s.name.toLowerCase().includes(query.toLowerCase()));
+          if (found?.length) {
+            return { content: [{ type: "text", text: found.map(formatSymbolDetail).join("\n\n---\n\n") }] };
+          }
+          return { content: [{ type: "text", text: `Symbol "${query}" not found.` }] };
+        }
+
+        return { content: [{ type: "text", text: toSummary(symbols, info.name, info.version, info.description) }] };
+
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Error: ${err.message}` }],
+          isError: true,
+        };
       }
-
-      const text =
-        entries.length > 0
-          ? `Available packages (${entries.length}):\n${entries.join("\n")}`
-          : "No packages with TypeScript types found in node_modules.";
-
-      return {
-        content: [{ type: "text", text }],
-      };
     }
 
     default:
-      return {
-        content: [{ type: "text", text: `Unknown tool: ${name}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
   }
 });
 
