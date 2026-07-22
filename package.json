@@ -7,7 +7,27 @@
     "ts-docs-mcp": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/index.d.ts.map",
+    "dist/types.js",
+    "dist/types.d.ts",
+    "dist/types.d.ts.map",
+    "dist/registry.js",
+    "dist/registry.d.ts",
+    "dist/registry.d.ts.map",
+    "dist/parser.js",
+    "dist/parser.d.ts",
+    "dist/parser.d.ts.map",
+    "dist/format.js",
+    "dist/format.d.ts",
+    "dist/format.d.ts.map",
+    "dist/cache.js",
+    "dist/cache.d.ts",
+    "dist/cache.d.ts.map",
+    "dist/throttle.js",
+    "dist/throttle.d.ts",
+    "dist/throttle.d.ts.map"
   ],
   "scripts": {
     "build": "tsc",
